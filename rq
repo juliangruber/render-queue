@@ -1,0 +1,1132 @@
+#!/usr/bin/python3
+"""rq: one render queue for several Claude Code sessions on one Mac.
+
+Strictly one heavy job at a time, first come first served. A session submits a
+heavy job with `rq run`, which waits for its turn, runs the command itself
+(so the session's environment, cwd and sandbox apply), streams its output live
+and exits with the job's exit code. The dispatcher (`rq daemon`) only decides
+whose turn it is and serves the status page.
+
+  rq run --name NAME [--project P] [--estimate 90m] -- COMMAND [ARGS...]
+  rq light --name NAME [--project P] -- COMMAND [ARGS...]   (light work: the light queue, one at a time, at nice 10)
+  rq status [--json]
+  rq log ID [-n LINES] [-f]
+  rq cancel ID | rq pause ID | rq resume ID
+  rq move ID first          (when the user says go: put a queued job next in line)
+  rq move ID queue          (pause a running light job and move it to the end of the main queue)
+  rq estimate ID 90m        (set or correct a job's expected duration)
+  rq keep ID                (when the user says so: a light job may run longer than 5 min)
+  rq start [--port 8642]    (start the dispatcher and status page detached, once per machine)
+  rq daemon [--port 8642]   (the same in the foreground)
+
+A single COMMAND argument runs through /bin/zsh -c, several run as argv.
+"""
+import argparse
+import fcntl
+import html
+import json
+import os
+import random
+import re
+import signal
+import statistics
+import string
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.dirname(os.path.realpath(__file__))
+STATE = os.environ.get("RQ_STATE", os.path.join(HOME, "state"))
+JOBS = os.path.join(STATE, "jobs")
+LOGS = os.path.join(STATE, "logs")
+FLAGS = os.path.join(STATE, "flags")
+GRANT = os.path.join(STATE, "grant")
+GRANT_LIGHT = os.path.join(STATE, "grant-light")  # the light queue's turn: one light job at a time
+ORDER = os.path.join(STATE, "order.json")
+DISPATCHER = os.path.join(STATE, "dispatcher.json")
+ROOT = os.path.realpath(os.environ.get("RQ_ROOT") or os.path.dirname(HOME))  # the folder that holds the projects
+ROOT_DASHED = re.sub(r"[^A-Za-z0-9]", "-", ROOT)  # as Claude Code names scratchpad and transcript folders
+SELF = os.path.basename(HOME)  # the queue's own folder, never a project
+PORT = 8642
+TICK = 2
+QUIET_NICE = 10  # processes at this niceness or more don't block the queue (stills, previews, tests)
+GROUP_HEAVY_CPU = 80  # a project's process group using this much CPU (%) outside the queue blocks it
+LIGHT_CAP = int(os.environ.get("RQ_LIGHT_CAP", 300))  # seconds a light job may run; then it is paused and moved into the queue (rq keep ID exempts it)
+QUIET_WINDOW = int(os.environ.get("RQ_QUIET_WINDOW", 120))  # seconds without outside work before the next job starts (bridges gaps between steps)
+TERMINAL = ("done", "failed", "cancelled", "lost")
+
+
+# ---------- files ----------
+
+def setup():
+    for d in (JOBS, LOGS, FLAGS):
+        os.makedirs(d, exist_ok=True)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def job_path(job_id):
+    return os.path.join(JOBS, job_id + ".json")
+
+
+def load_job(job_id):
+    return read_json(job_path(job_id))
+
+
+def save_job(job):
+    write_json(job_path(job["id"]), job)
+
+
+def all_jobs():
+    jobs = []
+    for name in os.listdir(JOBS):
+        if name.endswith(".json"):
+            job = read_json(os.path.join(JOBS, name))
+            if job:
+                jobs.append(job)
+    return jobs
+
+
+def flag(job_id, kind):
+    return os.path.join(FLAGS, "%s.%s" % (job_id, kind))
+
+
+def has_flag(job_id, kind):
+    return os.path.exists(flag(job_id, kind))
+
+
+def set_flag(job_id, kind, on=True):
+    path = flag(job_id, kind)
+    if on:
+        open(path, "w").close()
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def granted(path=GRANT):
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def give_turn(path, job_id):
+    with open(path + ".tmp", "w") as f:
+        f.write(job_id)
+    os.replace(path + ".tmp", path)
+
+
+# ---------- helpers ----------
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def group_alive(pgid):
+    if not pgid:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def parse_duration(text):
+    if not text:
+        return None
+    total = 0
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms]?)", text.strip().lower()):
+        total += float(value) * {"h": 3600, "m": 60, "s": 1, "": 60}[unit]
+    return int(total) or None
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    h, m = seconds // 3600, seconds % 3600 // 60
+    if h:
+        return "%dh%02dm" % (h, m)
+    if m:
+        return "%dm" % m
+    return "%ds" % seconds
+
+
+def fmt_time(ts):
+    return time.strftime("%H:%M", time.localtime(ts)) if ts else "?"
+
+
+def dashed(name):
+    """A name as Claude Code puts it in scratchpad and transcript folder names: anything but letters and digits a dash."""
+    return re.sub(r"[^A-Za-z0-9]", "-", name)
+
+
+def project_of(path):
+    """The project a path belongs to: its folder under ROOT, or its Claude Code scratchpad."""
+    if not path:
+        return None
+    m = re.search(re.escape(ROOT) + r"/([^/]+)", path)
+    if m:
+        return m.group(1)
+    m = re.search(re.escape(ROOT_DASHED) + r"-([^/]+?)/", path + "/")
+    if not m:
+        return None
+    name = m.group(1)
+    try:  # the dashed name back to its folder (my.film -> my-film -> my.film), also from a session in a subfolder
+        return max((n for n in os.listdir(ROOT) if name == dashed(n) or name.startswith(dashed(n) + "-")),
+                   key=len, default=name)
+    except OSError:
+        return name
+
+
+def new_id(project, name):
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", "%s-%s" % (project, name)).strip("-")[:60]
+    tail = "".join(random.choice(string.ascii_lowercase) for _ in range(3))
+    return "%s-%s-%s" % (time.strftime("%m%d-%H%M%S"), slug, tail)
+
+
+def dispatcher_state():
+    state = read_json(DISPATCHER, {}) or {}
+    state["alive"] = alive(state.get("pid")) and time.time() - state.get("beat", 0) < 30
+    return state
+
+
+# ---------- tools: which of Blender, Python and ffmpeg a job runs ----------
+
+TOOL_ORDER = ("blender", "python", "ffmpeg")
+SKIP_WORDS = {"nice", "env", "caffeinate", "time", "exec", "nohup", "command", "then", "do", "else", "elif", "if",
+              "while", "until", "!", "{", "(", "sudo"}
+SETUP_WORDS = {"cd", "set", "setopt", "export", "source", ".", "trap", "umask", "unset", "true", "rm", "mkdir", "cp",
+               "mv", "ln", "touch", "echo", "printf", ":", "for", "done", "fi", "local", "log", "shift", "return",
+               "exit", "test", "[", "[[", "case", "esac", "wait", "sleep", "cat", "tee", "grep", "sed", "awk", "ls"}
+UV_VALUE_FLAGS = {"--with", "--project", "--python", "-p", "--directory", "--group", "--extra", "--env-file"}
+_tool_cache = {}
+
+
+def tool_of_word(word):
+    base = os.path.basename(word.strip("\"'")).lower()
+    if base == "blender":
+        return "blender"
+    if base in ("ffmpeg", "ffprobe"):
+        return "ffmpeg"
+    if re.match(r"^python[0-9.]*$", base) or base == "py" or base.endswith(".py"):
+        return "python"
+    return None
+
+
+def program_words(text):
+    """The program word of each shell command in a script or command line, with the words after it."""
+    text = re.sub(r"\\\n", " ", text)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for part in re.split(r"&&|\|\||;|\||\$\(|`", line):
+            words = part.split()
+            i = 0
+            while i < len(words) and (words[i] in SKIP_WORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i])
+                                      or words[i].startswith("-") or words[i].isdigit()):
+                i += 1
+            if i >= len(words) or os.path.basename(words[i]) in SETUP_WORDS or words[i].endswith("()"):
+                continue
+            if words[i] == "uv" and i + 1 < len(words) and words[i + 1] == "run":
+                i += 2
+                while i < len(words) and words[i].startswith("-"):
+                    i += 2 if words[i] in UV_VALUE_FLAGS else 1
+                if i >= len(words):
+                    continue
+            yield words[i], words[i + 1:]
+
+
+def script_path(word, args, cwd, here):
+    """The script file a program word runs (itself, or the script a shell is given), if it can be found."""
+    if os.path.basename(word) in ("sh", "zsh", "bash"):
+        args = [a for a in args if not a.startswith("-")]
+        if not args:
+            return None
+        word = args[0]
+    if "$" in word:
+        return None
+    for base in (cwd, here):
+        path = os.path.normpath(os.path.join(base or "/", os.path.expanduser(word)))
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def read_script(path):
+    try:
+        if os.path.getsize(path) > 400000:
+            return None
+        with open(path, "rb") as f:
+            data = f.read()
+        return None if b"\0" in data[:4096] else data.decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def detect_tools(command, cwd, here=None, depth=0):
+    """Blender, Python and ffmpeg as the command, or the scripts it runs (two levels deep), call them."""
+    found = []
+    for word, args in program_words(command):
+        tool = tool_of_word(word)
+        if tool:
+            found.append(tool)
+        path = script_path(word, args, cwd, here) if depth < 2 else None
+        if not path:
+            continue
+        key = (path, os.path.getmtime(path), depth)
+        if key not in _tool_cache:
+            text = read_script(path) or ""
+            if path.endswith(".py"):  # a Python script, and the programs it starts
+                inner = ["python"] + [t for t in ("blender", "ffmpeg")
+                                      if re.search(r"""["'](?:[^"']*/)?%s["']""" % t, text, re.I)]
+            else:
+                inner = detect_tools(text, cwd, os.path.dirname(path), depth + 1)
+            _tool_cache[key] = inner
+        found += _tool_cache[key]
+    return [t for t in TOOL_ORDER if t in found]
+
+
+# ---------- estimates ----------
+
+def expected_duration(job, history):
+    if job.get("estimate"):
+        return job["estimate"]
+    same = [h["finished"] - h["started"] for h in history
+            if h["project"] == job["project"] and h["name"] == job["name"]]
+    if same:
+        return int(statistics.median(same))
+    return None
+
+
+def with_tools(jobs):
+    for job in jobs:
+        if "tools" not in job:
+            try:
+                job["tools"] = detect_tools(job["command"], job["cwd"])
+            except Exception:
+                job["tools"] = []
+    return jobs
+
+
+def snapshot():
+    """Everything the status command and page show, with expected start and end times."""
+    jobs = with_tools(all_jobs())
+    now = time.time()
+    history = sorted([j for j in jobs if j["status"] == "done" and j.get("started") and j.get("finished")
+                      and j.get("kind") != "light"],
+                     key=lambda j: j["finished"])
+    grant = granted()
+    current = next((j for j in jobs if j["id"] == grant and j["status"] not in TERMINAL), None)
+    queued = queue_order([j for j in jobs if j["status"] == "queued" and j.get("kind") != "light"
+                          and not has_flag(j["id"], "cancel")])
+    light = sorted([j for j in jobs if j.get("kind") == "light" and j["status"] in ("granted", "running")],
+                   key=lambda j: j["submitted"])
+    light_queued = queue_order([j for j in jobs if j.get("kind") == "light" and j["status"] == "queued"
+                                and not has_flag(j["id"], "cancel")])
+    for job in light:
+        job["elapsed"] = now - (job.get("started") or job["submitted"])
+    d = dispatcher_state()
+    # while the queue waits for renders outside it, nobody knows when they end, so start times are unknown
+    t = None if (not current and d.get("alive") and any(not w.get("low") for w in d.get("warnings", []))) else now
+    if current:
+        exp = expected_duration(current, history)
+        started = current.get("resumed") or current.get("started") or now  # a moved job: its estimate is what remains
+        current["expected"] = exp
+        current["elapsed"] = now - started
+        current["paused"] = has_flag(current["id"], "paused")
+        current["eta"] = started + exp if exp else None
+        t = max(current["eta"], now) if current["eta"] else None
+    for job in queued:
+        exp = expected_duration(job, history)
+        job["expected"] = exp
+        job["eta_start"] = t
+        t = t + exp if (t and exp) else None
+        job["eta"] = t
+    finished = sorted([j for j in jobs if j["status"] in TERMINAL], key=lambda j: j.get("finished") or 0,
+                      reverse=True)[:25]
+    return {"now": now, "dispatcher": d, "running": current, "queued": queued, "light": light,
+            "light_queued": light_queued,
+            "finished": finished, "all_done": t if (current or queued) else now}
+
+
+def queue_order(queued):
+    first = read_json(ORDER, []) or []
+    rank = {job_id: i for i, job_id in enumerate(first)}
+    return sorted(queued, key=lambda j: (rank.get(j["id"], len(rank)), j["submitted"]))
+
+
+# ---------- strays: heavy processes outside the queue ----------
+
+def processes():
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,pgid=,nice=,stat=,pcpu=,comm="],
+                         capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, ppid, pgid, nice, stat, cpu, comm = parts
+        try:
+            procs[int(pid)] = {"pid": int(pid), "ppid": int(ppid), "pgid": int(pgid), "nice": int(nice),
+                               "stat": stat, "cpu": float(cpu), "comm": comm}
+        except ValueError:
+            continue
+    return procs
+
+
+def cwd_of(pid):
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+
+def strays(jobs=()):
+    """Heavy work outside the queue, at normal priority (nice below QUIET_NICE), per process group: a busy or paused
+    Blender or ffmpeg (an encoder waiting for frames counts while its pipeline works), or a project's group
+    using more than about one core in total (e.g. a Python step)."""
+    if os.environ.get("RQ_IGNORE_OUTSIDE"):  # tests only
+        return []
+    procs = processes()
+    roots = {j["pid"] for j in jobs if j.get("pid")}
+    pgids = {j["pgid"] for j in jobs if j.get("pgid")}
+    mine = set()
+    for p in procs.values():
+        q, seen = p, 0
+        while q and seen < 50:
+            if q["pid"] in roots or q["pgid"] in pgids:
+                mine.add(p["pid"])
+                break
+            q, seen = procs.get(q["ppid"]), seen + 1
+    groups = {}
+    for p in procs.values():
+        if p["pid"] in mine or "claude" in p["comm"].lower():
+            continue
+        groups.setdefault((p["pgid"], p["nice"] >= QUIET_NICE), []).append(p)
+    found = {}
+    for (pgid, low), members in groups.items():
+        cpu = sum(p["cpu"] for p in members)
+        renderers = [p for p in members if os.path.basename(p["comm"]).lower() in ("blender", "ffmpeg")]
+        paused = bool(renderers) and all(p["stat"].startswith("T") for p in renderers)
+        if renderers:
+            parent_cpu = max((procs.get(p["ppid"]) or {}).get("cpu", 0) for p in renderers)
+            if not paused and cpu < 5 and parent_cpu < 5:
+                continue
+        elif cpu < GROUP_HEAVY_CPU:
+            continue
+        lead = max(renderers or members, key=lambda p: p["cpu"])
+        cwd = cwd_of(lead["pid"])
+        project = project_of(cwd)
+        if project == SELF or (not renderers and not project):
+            continue
+        project = project or "?"
+        what = os.path.basename(lead["comm"]).lower()
+        if low and (paused or cpu < GROUP_HEAVY_CPU):  # low priority: only heavy, running work is worth showing
+            continue
+        entry = found.setdefault((project, what, low), {"pid": lead["pid"], "what": what, "project": project,
+                                                        "cwd": cwd, "paused": paused, "count": 0, "cpu": 0, "low": low})
+        entry["count"] += len(renderers or members)
+        entry["cpu"] += cpu
+        entry["paused"] = entry["paused"] and paused
+    return list(found.values())
+
+
+def describe(found):
+    return ", ".join("%s %s%s (%s)%s" % (s["project"], s["what"], " paused" if s["paused"] else "",
+                                         "%d processes" % s["count"] if s.get("count", 1) > 1 else "pid %d" % s["pid"],
+                                         " (light, not holding the queue)" if s.get("low") else "")
+                     for s in found)
+
+
+# ---------- core usage ----------
+
+def all_cwds():
+    out = subprocess.run(["lsof", "-d", "cwd", "-Fpn"], capture_output=True, text=True).stdout
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def core_usage():
+    """Cores in use per project (by working directory, or a parent's), and on the whole machine (the bar's "others" is the difference)."""
+    procs = processes()
+    cwds = all_cwds()
+    own = {}
+    for pid in procs:
+        project = project_of(cwds.get(pid))
+        if project and project != SELF:
+            own[pid] = project
+
+    def owner(pid):
+        q, seen = procs.get(pid), 0
+        while q and seen < 30:
+            if q["pid"] in own:
+                return own[q["pid"]]
+            q, seen = procs.get(q["ppid"]), seen + 1
+        return None
+    projects = {}
+    for p in procs.values():
+        if p["cpu"] <= 0:
+            continue
+        project = owner(p["pid"])
+        if not project:
+            continue
+        entry = projects.setdefault(project, {"cores": 0.0, "low": 0.0})
+        entry["cores"] += p["cpu"] / 100
+        if p["nice"] >= QUIET_NICE:
+            entry["low"] += p["cpu"] / 100
+    for entry in projects.values():
+        entry["cores"] = round(entry["cores"], 2)
+        entry["low"] = round(entry["low"], 2)
+    return {"at": time.time(), "cores": os.cpu_count(), "machine": round(sum(p["cpu"] for p in procs.values()) / 100, 2),
+            "sessions": round(sum(e["cores"] for e in projects.values()), 2), "projects": projects}
+
+
+def gpu_sample():
+    """The GPU's device utilization (%) and core count, as macOS reports them without admin rights (whole GPU)."""
+    out = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], capture_output=True, text=True).stdout
+    util = re.search(r'"Device Utilization %"=(\d+)', out)
+    cores = re.search(r'"gpu-core-count" = (\d+)', out)
+    return (int(util.group(1)) if util else None), (int(cores.group(1)) if cores else None)
+
+
+# ---------- sessions waiting for the user ----------
+
+SESSIONS = os.path.join(STATE, "sessions.json")  # {project: link to its session or null}, the sessions to watch
+CHATS = os.path.join(os.path.expanduser("~/.claude/projects"), ROOT_DASHED + "-")  # + project: its transcripts
+
+
+def utc_ts(text):
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def last_turn(path):
+    """The last entry of the latest turn that wasn't started by another session (a peer message) and ended, or the
+    last entry of all if a turn is still under way. Reads only the transcript's tail."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - 1048576))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    turns = []  # [starter kind, last user/assistant entry]
+    last = None
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain"):
+            continue
+        last = entry
+        content = (entry.get("message") or {}).get("content")
+        prompt = entry["type"] == "user" and not (isinstance(content, list) and any(
+            isinstance(c, dict) and c.get("type") == "tool_result" for c in content))
+        if prompt:
+            turns.append([(entry.get("origin") or {}).get("kind") or "human", entry])
+        elif turns:
+            turns[-1][1] = entry
+    if not last:
+        return None
+    ended = lambda e: e["type"] == "assistant" and (e.get("message") or {}).get("stop_reason") == "end_turn"
+    if not ended(last):
+        return last  # a turn is under way: working, a question or a permission prompt
+    for kind, entry in reversed(turns):
+        if kind != "peer" and ended(entry):
+            return entry
+    return last
+
+
+def session_states():
+    """Per session: waiting for the user (turn ended, a question, maybe a permission prompt) or working.
+    Read from each session's chat transcript tail and its Claude process, never by asking the session."""
+    links = read_json(SESSIONS, {}) or {}
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    procs = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs.append((int(parts[0]), int(parts[1]), parts[2]))
+    children = {}
+    for pid, ppid, command in procs:
+        children.setdefault(ppid, []).append(command)
+    resumed = {}  # transcript id -> the session's claude process
+    for pid, ppid, command in procs:
+        m = re.search(r"/claude\.app/Contents/MacOS/claude .*--resume=([0-9a-f-]{36})", command)
+        if m and "disclaimer" not in command.split()[0]:  # the session itself, not its launcher
+            resumed[m.group(1)] = pid
+    now = time.time()
+    jobs = {}  # a project's jobs in rq: queued or running
+    for job in all_jobs():
+        if job["status"] in ("queued", "granted", "running"):
+            counts = jobs.setdefault(job["project"], {"running": 0, "queued": 0})
+            counts["queued" if job["status"] == "queued" else "running"] += 1
+    states = []
+    for project in sorted(links):
+        folder = CHATS + dashed(project)
+        try:
+            chats = [os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".jsonl")]
+        except OSError:
+            continue
+        live = [c for c in chats if os.path.basename(c)[:-6] in resumed]
+        chat = max(live or chats, key=os.path.getmtime, default=None)
+        if not chat:
+            continue
+        entry = last_turn(chat)
+        if not entry:
+            continue
+        claude = resumed.get(os.path.basename(chat)[:-6])
+        shells = [c for c in children.get(claude, []) if "shell-snapshots" in c or c.startswith("/bin/zsh -c")]
+        msg = entry.get("message") or {}
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        since = utc_ts(entry.get("timestamp") or "")
+        tool = next((c for c in reversed(content) if isinstance(c, dict) and c.get("type") == "tool_use"), None)
+        state = "working"
+        if entry["type"] == "assistant" and msg.get("stop_reason") == "end_turn":
+            state = "jobs" if project in jobs else "waiting"  # with jobs in rq, it waits for them, not for the user
+        elif entry["type"] == "assistant" and tool:
+            if tool.get("name") == "AskUserQuestion":
+                state = "question"
+            elif since and now - since > 30 and not shells:
+                state = "permission"
+        states.append({"project": project, "state": state, "since": since, "link": links.get(project),
+                       "background": len(shells) if state == "waiting" else 0,
+                       "tool": tool.get("name") if tool and state == "permission" else None,
+                       "jobs": jobs.get(project)})
+    return states
+
+
+# ---------- dispatcher ----------
+
+def repair_grants(jobs):
+    """A job marked granted that holds no turn (the dispatcher stopped between the two writes) goes back in line."""
+    turns = {granted(GRANT), granted(GRANT_LIGHT)}
+    for job in jobs.values():
+        if job["status"] == "granted" and job["id"] not in turns:
+            job["status"] = "queued"
+            save_job(job)
+
+
+def dispatch_light(jobs):
+    """The light queue: one light job at a time, oldest first. A running light job (also one started before this
+    queue existed) holds the slot; one that ran over the cap and moved into the main queue frees it."""
+    turn = granted(GRANT_LIGHT)
+    if turn:
+        job = load_job(turn)
+        if not job or job["status"] in TERMINAL or job.get("kind") != "light":
+            os.remove(GRANT_LIGHT)
+            turn = None
+    if turn:
+        return
+    current = [j for j in all_jobs() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
+    if current:
+        return
+    waiting = queue_order([j for j in all_jobs() if j.get("kind") == "light" and j["status"] == "queued"])
+    if waiting:
+        job = waiting[0]
+        give_turn(GRANT_LIGHT, job["id"])
+        job.update(status="granted", granted=time.time())
+        save_job(job)
+
+
+def dispatch_once(state):
+    jobs = {j["id"]: j for j in all_jobs()}
+    for job in jobs.values():
+        if job.get("kind") == "light" and job["status"] not in TERMINAL and not alive(job.get("client_pid")) \
+                and not group_alive(job.get("pgid")):
+            job.update(status="lost", finished=time.time())
+            save_job(job)
+    for job in jobs.values():  # queued light jobs whose session is gone or that were cancelled
+        if job.get("kind") == "light" and job["status"] == "queued" and (
+                not alive(job.get("client_pid")) or has_flag(job["id"], "cancel")):
+            job.update(status="cancelled" if has_flag(job["id"], "cancel") else "lost", finished=time.time())
+            save_job(job)
+    repair_grants(jobs)
+    dispatch_light(jobs)
+    ours = [j for j in jobs.values() if j["status"] == "running" or (j["status"] == "queued" and j.get("pgid"))]
+    grant = granted()
+    note = ""
+    if grant:
+        job = jobs.get(grant)
+        if not job or job["status"] in TERMINAL:
+            os.remove(GRANT)
+            grant = None
+        elif not alive(job.get("client_pid")):
+            if job.get("pgid") and group_alive(job["pgid"]):
+                note = "%s: its rq client is gone, waiting for the job's processes to end" % grant
+            else:
+                job.update(status="lost", finished=time.time())
+                save_job(job)
+                os.remove(GRANT)
+                grant = None
+        elif job["status"] == "granted" and time.time() - job.get("granted", 0) > 120:
+            note = "%s: granted but not started yet" % grant
+    if grant:
+        job = jobs[grant]
+        state["warnings"] = strays(ours)
+        state["note"] = note or "running %s" % grant
+        return
+    for job in jobs.values():  # queued jobs whose session is gone
+        if job["status"] == "queued" and job.get("kind") != "light" and (not alive(job.get("client_pid")) or has_flag(job["id"], "cancel")):
+            if job.get("pgid") and group_alive(job["pgid"]):  # a moved light job, paused: don't leave it frozen
+                try:
+                    os.killpg(job["pgid"], signal.SIGCONT)
+                    os.killpg(job["pgid"], signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            job.update(status="cancelled" if has_flag(job["id"], "cancel") else "lost", finished=time.time())
+            save_job(job)
+    queued = queue_order([j for j in all_jobs() if j["status"] == "queued" and j.get("kind") != "light"])
+    state["warnings"] = strays(ours)
+    found = [w for w in state["warnings"] if not w.get("low")]
+    if not queued:
+        if found:
+            state["outside_seen"] = time.time()
+        state["note"] = "idle" + (" (outside the queue: %s)" % describe(found) if found else "")
+        return
+    if found:
+        state["outside_seen"] = time.time()
+        state["note"] = "waiting: %s running outside the queue" % describe(found)
+        return
+    quiet = time.time() - state.get("outside_seen", 0)
+    if quiet < QUIET_WINDOW:
+        state["note"] = "waiting for %d min without outside work (%ds so far)" % (QUIET_WINDOW // 60, quiet)
+        return
+    job = queued[0]
+    give_turn(GRANT, job["id"])
+    if job.get("resume_by_dispatcher") and group_alive(job.get("pgid")):  # moved from outside: continue it here
+        os.killpg(job["pgid"], signal.SIGCONT)
+        job.update(status="running", granted=time.time(), resumed=time.time())
+    else:
+        job.update(status="granted", granted=time.time())
+    save_job(job)
+    first = [i for i in (read_json(ORDER, []) or []) if i != job["id"]]
+    write_json(ORDER, first)
+    state["note"] = "granted %s" % job["id"]
+
+
+def cmd_daemon(args):
+    setup()
+    lock = open(os.path.join(STATE, "dispatcher.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("rq: a dispatcher is already running (%s)" % dispatcher_state().get("pid"))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print("rq: dispatcher running, status page on http://localhost:%d" % args.port, flush=True)
+    state = {"pid": os.getpid(), "since": time.time(), "port": args.port, "outside_seen": time.time()}
+    while True:
+        try:
+            dispatch_once(state)
+        except Exception as e:  # keep dispatching; show the error on the page
+            state["note"] = "error: %r" % e
+        try:
+            util, gpu_cores = gpu_sample()
+            if util is not None:
+                samples = (state.get("gpu", {}).get("samples") or [])[-4:] + [util]  # the last 10 s
+                state["gpu"] = {"util": round(sum(samples) / len(samples)), "now": util, "cores": gpu_cores,
+                                "samples": samples, "at": time.time()}
+        except Exception as e:
+            state["gpu"] = {"error": repr(e)}
+        if time.time() - state.get("usage", {}).get("at", 0) >= 5:
+            try:
+                state["sessions"] = session_states()
+            except Exception as e:
+                state["sessions"] = []
+                state["sessions_error"] = repr(e)
+            try:
+                state["usage"] = core_usage()
+            except Exception as e:
+                state["usage"] = {"at": time.time(), "error": repr(e)}
+        state["beat"] = time.time()
+        write_json(DISPATCHER, state)
+        time.sleep(TICK)
+
+
+def cmd_start(args):
+    """Start the dispatcher detached in its own session, so it outlives the shell and session that started it."""
+    if dispatcher_state()["alive"]:
+        print("rq: the dispatcher is already running (pid %s)" % dispatcher_state()["pid"])
+        return
+    if os.fork():
+        for _ in range(30):
+            time.sleep(0.5)
+            d = dispatcher_state()
+            if d["alive"] and d.get("since", 0) > time.time() - 60:
+                break
+        print("rq: dispatcher %s, status page on http://localhost:%d" % (
+            "running (pid %s)" % d["pid"] if d["alive"] else "did not start, see " + os.path.join(STATE, "daemon.out"),
+            args.port))
+        return
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    out = os.open(os.path.join(STATE, "daemon.out"), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    os.dup2(out, 1)
+    os.dup2(out, 2)
+    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+    os.execv(os.path.realpath(__file__), [os.path.realpath(__file__), "daemon", "--port", str(args.port)])
+
+
+# ---------- client: rq run ----------
+
+def say(text):
+    sys.stdout.write("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text))
+    sys.stdout.flush()
+
+
+def cmd_run(args):
+    setup()
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        sys.exit("rq run: no command (rq run --name NAME -- COMMAND)")
+    argv = ["/bin/zsh", "-c", command[0]] if len(command) == 1 else command
+    light = args.cmd == "light"
+    if light:  # the light queue: one at a time, at low priority, never holds the main queue
+        argv = ["nice", "-n", str(QUIET_NICE)] + argv
+    project = args.project or project_of(os.getcwd()) or "unknown"
+    job = {"id": new_id(project, args.name), "project": project, "name": args.name, "cwd": os.getcwd(),
+           "command": " ".join(command), "estimate": parse_duration(args.estimate), "client_pid": os.getpid(),
+           "submitted": time.time(), "status": "queued", "kind": "light" if light else "heavy"}
+    try:
+        job["tools"] = detect_tools(job["command"], job["cwd"])
+    except Exception:
+        job["tools"] = []
+    save_job(job)
+    log_path = os.path.join(LOGS, job["id"] + ".log")
+    open(log_path, "w").close()
+    state = {"job": job, "pgid": None}
+
+    def stop(signum, frame):
+        if state["pgid"]:
+            set_flag(job["id"], "cancel")
+            try:
+                os.killpg(state["pgid"], signal.SIGCONT)
+                os.killpg(state["pgid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            current = load_job(job["id"]) or job
+            current.update(status="cancelled", finished=time.time())
+            save_job(current)
+            say("cancelled while queued")
+            sys.exit(130)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, stop)
+
+    say("%s %s" % ("light job, queued for the light slot:" if light else "queued", job["id"]))
+    say("status page: http://localhost:%d" % (dispatcher_state().get("port") or PORT))
+    last, warned = None, False
+    turn_file = GRANT_LIGHT if light else GRANT
+    while True:
+        if has_flag(job["id"], "cancel"):
+            current = load_job(job["id"]) or job
+            current.update(status="cancelled", finished=time.time())
+            save_job(current)
+            say("cancelled while queued")
+            return 130
+        if granted(turn_file) == job["id"]:
+            break
+        d = dispatcher_state()
+        if not d["alive"] and not warned:
+            say("warning: the rq dispatcher isn't running; still waiting (the queue session starts it with rq start)")
+            warned = True
+        snap = snapshot()
+        line = snap["light_queued"] if light else snap["queued"]
+        position = next((i + 1 for i, j in enumerate(line) if j["id"] == job["id"]), None)
+        r = (snap["light"] or [None])[0] if light else snap["running"]
+        status = "waiting%s, position %s" % (" for the light slot" if light else "", position)
+        if r:
+            status += ", %s now: %s/%s" % ("light job" if light else "rendering", r["project"], r["name"])
+        elif not light and d.get("note", "").startswith("waiting"):
+            status += ", " + d["note"]
+        if status != last:
+            say(status)
+            last = status
+        time.sleep(1)
+
+    job = load_job(job["id"]) or job
+    say("starting: %s (in %s)" % (job["command"], job["cwd"]))
+    with open(log_path, "ab") as log:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        state["pgid"] = proc.pid
+        job.update(status="running", started=time.time(), pid=proc.pid, pgid=proc.pid)
+        save_job(job)
+        subprocess.Popen(["caffeinate", "-i", "-w", str(proc.pid)])
+        if light:
+            threading.Thread(target=cap_light, args=(job["id"], proc), daemon=True).start()
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+            log.write(chunk)
+            log.flush()
+        code = proc.wait()
+    job = load_job(job["id"]) or job
+    cancelled = has_flag(job["id"], "cancel")
+    job.update(status="cancelled" if cancelled else ("done" if code == 0 else "failed"), exit=code,
+               finished=time.time())
+    save_job(job)
+    for kind in ("cancel", "paused", "keep"):
+        set_flag(job["id"], kind, False)
+    say("%s %s: exit %d after %s" % (job["status"], job["id"], code, fmt_duration(job["finished"] - job["started"])))
+    return code if code >= 0 else 128 - code
+
+
+def cap_light(job_id, proc):
+    """A light job that runs longer than LIGHT_CAP is paused and queued as a heavy job; it continues, with its
+    progress, when it's its turn. `rq keep ID` lets it run on."""
+    while proc.poll() is None:
+        time.sleep(2)
+        job = load_job(job_id) or {}
+        if has_flag(job_id, "keep") or has_flag(job_id, "cancel"):
+            return
+        if time.time() - job.get("started", time.time()) < LIGHT_CAP:
+            continue
+        try:
+            os.killpg(proc.pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            return
+        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time())
+        save_job(job)
+        say("ran longer than %s as light work: paused and moved into the queue, continuing when it's its turn"
+            % fmt_duration(LIGHT_CAP))
+        last = None
+        while proc.poll() is None:
+            if has_flag(job_id, "cancel"):
+                return  # cmd_cancel continues and stops the processes
+            if granted() == job_id:
+                job = load_job(job_id) or job
+                job.update(status="running", resumed=time.time())
+                save_job(job)
+                os.killpg(proc.pid, signal.SIGCONT)
+                say("its turn: continuing")
+                return
+            snap = snapshot()
+            position = next((i + 1 for i, j in enumerate(snap["queued"]) if j["id"] == job_id), None)
+            if position != last:
+                say("paused, waiting in the queue, position %s" % position)
+                last = position
+            time.sleep(TICK)
+        return
+
+
+# ---------- control ----------
+
+def find_job(prefix):
+    jobs = [j for j in all_jobs() if j["id"] == prefix] or [j for j in all_jobs() if prefix in j["id"]]
+    if len(jobs) != 1:
+        sys.exit("rq: %s matches %d jobs" % (prefix, len(jobs)))
+    return jobs[0]
+
+
+def cmd_cancel(args):
+    job = find_job(args.id)
+    if job["status"] in TERMINAL:
+        sys.exit("rq: %s is already %s" % (job["id"], job["status"]))
+    set_flag(job["id"], "cancel")
+    if job.get("pgid") and group_alive(job["pgid"]):
+        os.killpg(job["pgid"], signal.SIGCONT)
+        os.killpg(job["pgid"], signal.SIGTERM)
+    print("rq: cancelling %s" % job["id"])
+
+
+def cmd_pause(args, pause=True):
+    job = find_job(args.id)
+    if job["status"] != "running" or not group_alive(job.get("pgid")):
+        sys.exit("rq: %s isn't running" % job["id"])
+    os.killpg(job["pgid"], signal.SIGSTOP if pause else signal.SIGCONT)
+    set_flag(job["id"], "paused", pause)
+    print("rq: %s %s (it keeps its turn)" % ("paused" if pause else "resumed", job["id"]))
+
+
+def cmd_estimate(args):
+    job = find_job(args.id)
+    if job["status"] in TERMINAL:
+        sys.exit("rq: %s is already %s" % (job["id"], job["status"]))
+    seconds = parse_duration(args.duration)
+    if not seconds:
+        sys.exit("rq: %r isn't a duration (e.g. 45m, 2h30m)" % args.duration)
+    job["estimate"] = seconds
+    save_job(job)
+    print("rq: %s is expected to take %s" % (job["id"], fmt_duration(seconds)))
+
+
+def cmd_keep(args):
+    job = find_job(args.id)
+    if job.get("kind") != "light" or job["status"] in TERMINAL:
+        sys.exit("rq: %s isn't a running light job" % job["id"])
+    set_flag(job["id"], "keep")
+    print("rq: %s may run on as light work, past the cap" % job["id"])
+
+
+def cmd_move(args):
+    job = find_job(args.id)
+    if args.where == "queue":  # a running light job, paused and moved to the end of the main queue
+        if job.get("kind") != "light" or job["status"] != "running" or not group_alive(job.get("pgid")):
+            sys.exit("rq: %s isn't a running light job" % job["id"])
+        set_flag(job["id"], "keep")  # its own client must not move it again
+        os.killpg(job["pgid"], signal.SIGSTOP)
+        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(),
+                   resume_by_dispatcher=True)
+        save_job(job)
+        print("rq: paused %s and moved it to the end of the main queue; it continues when it's its turn" % job["id"])
+        return
+    if job["status"] != "queued":
+        sys.exit("rq: %s isn't queued" % job["id"])
+    first = [i for i in (read_json(ORDER, []) or []) if i != job["id"]]
+    write_json(ORDER, [job["id"]] + first)
+    print("rq: %s is next in line" % job["id"])
+
+
+def cmd_log(args):
+    job = find_job(args.id)
+    path = os.path.join(LOGS, job["id"] + ".log")
+    os.execvp("tail", ["tail", "-n", str(args.n)] + (["-f"] if args.f else []) + [path])
+
+
+def cmd_status(args):
+    setup()
+    snap = snapshot()
+    if args.json:
+        print(json.dumps(snap, indent=1))
+        return
+    d = snap["dispatcher"]
+    print("dispatcher: %s%s" % ("running" if d["alive"] else "NOT RUNNING", " - " + d.get("note", "") if d["alive"] else ""))
+    u = d.get("usage") or {}
+    if u.get("projects") is not None:
+        busy = [(k, v["cores"]) for k, v in sorted(u["projects"].items(), key=lambda kv: -kv[1]["cores"]) if v["cores"] >= 0.05]
+        busy.append(("others", max(0, u["machine"] - u["sessions"])))
+        print("cores: sessions %.1f of %d: %s" % (u["sessions"], u["cores"], ", ".join("%s %.1f" % b for b in busy)))
+    g = d.get("gpu") or {}
+    if g.get("util") is not None:
+        print("gpu: %d%% of %s GPU cores (average over 10 s)" % (g["util"], g.get("cores") or "?"))
+    r = snap["running"]
+    if r:
+        print("\nrunning:  %s  %s/%s  %s elapsed, expected %s, done ~%s%s" % (
+            r["id"], r["project"], r["name"], fmt_duration(r["elapsed"]), fmt_duration(r["expected"]),
+            fmt_time(r["eta"]), "  PAUSED" if r["paused"] else ""))
+    for j in snap["light"]:
+        print("\nlight:    %s  %s/%s  %s elapsed" % (j["id"], j["project"], j["name"], fmt_duration(j["elapsed"])))
+    if snap["light_queued"]:
+        print("\nlight queue:")
+        for i, j in enumerate(snap["light_queued"], 1):
+            print("  %d. %s  %s/%s" % (i, j["id"], j["project"], j["name"]))
+    if snap["queued"]:
+        print("\nqueued:")
+        for i, j in enumerate(snap["queued"], 1):
+            print("  %d. %s  %s/%s  expected %s, start ~%s, done ~%s" % (
+                i, j["id"], j["project"], j["name"], fmt_duration(j["expected"]), fmt_time(j["eta_start"]),
+                fmt_time(j["eta"])))
+    for w in d.get("warnings", []):
+        print("\noutside the queue: %s" % describe([w]))
+    if snap["finished"]:
+        print("\nrecent:")
+        for j in snap["finished"][:8]:
+            took = fmt_duration(j["finished"] - j["started"]) if j.get("started") and j.get("finished") else "-"
+            print("  %s  %-9s %s/%s  %s" % (fmt_time(j.get("finished")), j["status"], j["project"], j["name"], took))
+
+
+# ---------- status page ----------
+
+class Page(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send(self, body, kind="text/html; charset=utf-8", code=200):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", kind)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/" or self.path.startswith("/?"):
+            with open(os.path.join(HOME, "status.html")) as f:
+                return self.send(f.read())
+        if self.path == "/api/status":
+            return self.send(json.dumps(snapshot()), "application/json")
+        self.send("not found", "text/plain", 404)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="rq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, text in (("run", "queue a heavy job, run it when it's its turn, stream its output"),
+                       ("light", "queue a light job: one at a time, at low priority, next to the main queue")):
+        r = sub.add_parser(name, help=text, description=text)
+        r.add_argument("--name", required=True)
+        r.add_argument("--project", help="default: from the current folder")
+        r.add_argument("--estimate", help="e.g. 90m, 2h30m, 45s")
+        r.add_argument("command", nargs=argparse.REMAINDER)
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    for name in ("cancel", "pause", "resume", "keep"):
+        sub.add_parser(name).add_argument("id")
+    m = sub.add_parser("move")
+    m.add_argument("id")
+    m.add_argument("where", choices=["first", "queue"])
+    e = sub.add_parser("estimate")
+    e.add_argument("id")
+    e.add_argument("duration")
+    l = sub.add_parser("log")
+    l.add_argument("id")
+    l.add_argument("-n", type=int, default=40)
+    l.add_argument("-f", action="store_true")
+    for name in ("daemon", "start"):
+        sub.add_parser(name).add_argument("--port", type=int, default=PORT)
+    args = p.parse_args()
+    setup()
+    if args.cmd in ("run", "light"):
+        sys.exit(cmd_run(args))
+    {"status": cmd_status, "cancel": cmd_cancel, "pause": cmd_pause,
+     "resume": lambda a: cmd_pause(a, False), "move": cmd_move, "keep": cmd_keep, "estimate": cmd_estimate, "log": cmd_log, "daemon": cmd_daemon,
+     "start": cmd_start}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
