@@ -2,7 +2,7 @@
 
 `rq` lets several [Claude Code](https://claude.com/claude-code) sessions share one Mac for rendering, each working on
 its own project. Heavy jobs run strictly one at a time, first come first served. Short light jobs run next to them at
-low priority, and heavy work started outside the queue holds it up instead of slowing everything down unnoticed. A
+low priority. A
 local status page shows the queue with expected start and end times, the CPU cores each project uses, the GPU load and
 which sessions are waiting for you.
 
