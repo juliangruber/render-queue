@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Render Queue</title>
+<link rel="icon" id="favicon" href="data:,">
 <style>
 :root {
   --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6d6a64; --line: #e3e0da;
@@ -102,6 +103,18 @@ a.proj:hover { border-bottom-color: var(--ink); }
 </main>
 <script>
 const $ = id => document.getElementById(id);
+// the tab icon: three queue bars, the first one in progress; an amber dot while a session waits for you
+const favicon = waiting => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+    <rect width="32" height="32" rx="7" fill="#1d1c1a"/>
+    <rect x="6" y="7" width="20" height="4" rx="2" fill="#3a3936"/><rect x="6" y="7" width="13" height="4" rx="2" fill="#3987e5"/>
+    <rect x="6" y="14" width="20" height="4" rx="2" fill="#6d6a64"/>
+    <rect x="6" y="21" width="14" height="4" rx="2" fill="#6d6a64"/>
+    ${waiting ? '<circle cx="25" cy="25" r="6" fill="#fab219" stroke="#1d1c1a" stroke-width="2"/>' : ""}</svg>`;
+  const href = "data:image/svg+xml," + encodeURIComponent(svg);
+  if ($("favicon").getAttribute("href") !== href) $("favicon").setAttribute("href", href);
+};
+favicon(false);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const t = ts => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false}) : "?";
 const day = ts => {
@@ -239,6 +252,7 @@ async function refresh() {
     ? `<span class="dot on"></span>dispatcher running · ${esc(d.note || "")}`
     : `<span class="dot off"></span>dispatcher not running`;
   showWaiting(d.sessions);
+  favicon((d.sessions || []).some(x => !["working", "jobs"].includes(x.state)));
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;
