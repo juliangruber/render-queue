@@ -53,7 +53,7 @@ PORT = 8642
 TICK = 2
 QUIET_NICE = 10  # processes at this niceness or more don't block the queue (stills, previews, tests)
 GROUP_HEAVY_CPU = 80  # a project's process group using this much CPU (%) outside the queue blocks it
-LIGHT_CAP = int(os.environ.get("RQ_LIGHT_CAP", 300))  # seconds a light job may run; then it is paused and moved into the queue (rq keep ID exempts it)
+LIGHT_CAP = int(os.environ.get("RQ_LIGHT_CAP", 300))  # applies only while other work is active (other_work)  # seconds a light job may run; then it is paused and moved into the queue (rq keep ID exempts it)
 QUIET_WINDOW = int(os.environ.get("RQ_QUIET_WINDOW", 120))  # seconds without outside work before the next job starts (bridges gaps between steps)
 TERMINAL = ("done", "failed", "cancelled", "lost")
 
@@ -915,9 +915,23 @@ def cmd_run(args):
     return code if code >= 0 else 128 - code
 
 
+def other_work(job_id):
+    """Work a long light job would hold up or compete with: a heavy job running or queued, or a light job waiting."""
+    for job in all_jobs():
+        if job["id"] == job_id:
+            continue
+        if job.get("kind") == "light" and job["status"] == "queued":
+            return job
+        if job.get("kind") != "light" and job["status"] in ("queued", "granted", "running"):
+            return job
+    return None
+
+
 def cap_light(job_id, proc):
-    """A light job that runs longer than LIGHT_CAP is paused and queued as a heavy job; it continues, with its
-    progress, when it's its turn. `rq keep ID` lets it run on."""
+    """A light job that runs longer than LIGHT_CAP while other work is active (a heavy job, or a light job waiting)
+    is paused and queued as a heavy job; it continues, with its progress, when it's its turn. Alone, it runs on.
+    `rq keep ID` lets it run on in any case."""
+    alone_said = False
     while proc.poll() is None:
         time.sleep(2)
         job = load_job(job_id) or {}
@@ -925,14 +939,20 @@ def cap_light(job_id, proc):
             return
         if time.time() - job.get("started", time.time()) < LIGHT_CAP:
             continue
+        if not other_work(job_id):
+            if not alone_said:
+                say("running longer than %s as light work, but nothing else is waiting: it runs on"
+                    % fmt_duration(LIGHT_CAP))
+                alone_said = True
+            continue
         try:
             os.killpg(proc.pid, signal.SIGSTOP)
         except ProcessLookupError:
             return
         job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time())
         save_job(job)
-        say("ran longer than %s as light work: paused and moved into the queue, continuing when it's its turn"
-            % fmt_duration(LIGHT_CAP))
+        say("ran longer than %s as light work while other work is waiting: paused and moved into the queue, "
+            "continuing when it's its turn" % fmt_duration(LIGHT_CAP))
         last = None
         while proc.poll() is None:
             if has_flag(job_id, "cancel"):

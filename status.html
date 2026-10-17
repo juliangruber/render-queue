@@ -296,7 +296,7 @@ async function refresh() {
 
   $("queue").innerHTML = s.queued.length ? `<table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th>
     <th>Expected</th><th>Start</th><th>Done</th></tr>${s.queued.map((j, i) => `<tr><td class="num">${i + 1}</td>
-    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ' <span class="tag paused" title="It ran longer than 5 min as light work, so it was paused and moved into the queue">paused · was light</span>' : ""}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
+    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ' <span class="tag paused" title="It ran longer than 5 min as light work while other work was waiting, so it was paused and moved into the queue">paused · was light</span>' : ""}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
     <td class="num">${dur(j.expected)}</td><td class="num">~${day(j.eta_start)}</td><td class="num">~${day(j.eta)}</td></tr>`).join("")}</table>`
     : `<div class="empty">Nothing waiting.</div>`;
   // the second queue: light jobs wait for the one light slot, independent of the main queue

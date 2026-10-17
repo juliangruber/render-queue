@@ -102,7 +102,7 @@ This machine is shared with other sessions through one render queue: heavy jobs 
 - Light work under 5 minutes (stills, tests, previews) goes through `rq light`, also as a background task:
   `/path/to/render-queue/rq light --name NAME -- COMMAND`
   Light jobs run one at a time at low priority next to the heavy job, so one may wait for its turn. One that runs
-  past 5 minutes is paused and moved into the queue, and continues when it's its turn.
+  past 5 minutes while other work is waiting is paused and moved into the queue, and continues when it's its turn.
 - Never run renders, Blender, ffmpeg or other heavy work outside rq: it holds up the whole queue.
 - Tell me the job id when you queue a job. `/path/to/render-queue/rq status` shows its position and expected
   times; the status page is http://localhost:8642.
@@ -137,8 +137,9 @@ This machine is shared with other sessions through one render queue: heavy jobs 
 - **Light work** (`rq light`) has its own queue: one light job at a time, first come first served, next to the heavy
   job (the two queues don't wait for each other). It runs at low priority (`nice -n 10`), streams its output the same
   way and shows on the status page under "Rendering now". It never holds up the main queue.
-- Light work is capped at 5 minutes. A light job that runs longer is paused where it is and moved to the end of the
-  queue as a heavy job; it continues, with its progress, when it's its turn (the status page marks it "paused · was
+- Light work is capped at 5 minutes while other work is active (a heavy job running or queued, or a light job
+  waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
+  and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status page marks it "paused · was
   light"). `rq keep ID` before the 5 minutes are up lets it run on; once it is paused, `rq move ID first` makes it the
   next job.
 - **Work outside the queue:** a busy or paused Blender or ffmpeg anywhere on the machine, or any other process group
