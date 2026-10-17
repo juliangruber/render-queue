@@ -200,8 +200,6 @@ function showWaiting(sessions) {
   const now = Date.now() / 1000;
   const waiting = sessions.filter(x => !["working", "jobs"].includes(x.state)).sort((a, b) => (a.since || 0) - (b.since || 0));
   const working = sessions.filter(x => x.state === "working").map(x => x.project);
-  const onJobs = sessions.filter(x => x.state === "jobs");
-  const jobText = j => [j.running ? j.running + " running" : "", j.queued ? j.queued + " queued" : ""].filter(Boolean).join(", ");
   const name = x => x.link ? `<a href="${esc(x.link)}" class="proj">${esc(x.project)}</a>` : `<span class="proj">${esc(x.project)}</span>`;
   $("waiting").innerHTML = `<h2>Waiting for you</h2>${waiting.length ? `<table>
     <tr><th>Session</th><th>State</th><th>Since</th><th class="hide-sm">Background</th></tr>
@@ -210,8 +208,7 @@ function showWaiting(sessions) {
       <td class="num">${x.since ? day(x.since) + ` <span class="sub">(${dur(now - x.since)})</span>` : "?"}</td>
       <td class="hide-sm sub">${x.background ? x.background + " task" + (x.background > 1 ? "s" : "") + " running" : ""}</td></tr>`).join("")}</table>`
     : `<div class="empty">No session is waiting for you.</div>`}
-    ${working.length ? `<div class="sub" style="margin-top:8px">Working: ${working.map(esc).join(", ")}</div>` : ""}
-    ${onJobs.length ? `<div class="sub" style="margin-top:4px">Waiting for their jobs: ${onJobs.map(x => `${esc(x.project)} (${jobText(x.jobs || {})})`).join(", ")}</div>` : ""}`;
+    ${working.length ? `<div class="sub" style="margin-top:8px">Working: ${working.map(esc).join(", ")}</div>` : ""}`;
 }
 
 function showGpu(g) {

@@ -607,6 +607,8 @@ def session_states():
         except OSError:
             continue
         live = [c for c in chats if os.path.basename(c)[:-6] in resumed]
+        if resumed and not live:
+            continue  # sessions run as processes here, and this one has none: it was archived or closed
         chat = max(live or chats, key=os.path.getmtime, default=None)
         if not chat:
             continue

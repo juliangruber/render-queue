@@ -64,7 +64,8 @@ A Claude Code session in the `render-queue` folder. It runs no renders itself.
    The page then shows when a session's turn has ended, when it asked you a question or when a tool call may wait
    for your permission. A session with jobs in the queue waits for them, not for you. This works best with sessions
    in the Claude desktop app, where rq finds each session's process; otherwise it reads the project's newest
-   transcript only. Without `sessions.json`, the page leaves "Waiting for you" out.
+   transcript only. A watched session without a running process (archived or closed) is left out. Without
+  `sessions.json`, the page leaves "Waiting for you" out.
 
 From then on you tell the queue session what to change, and it runs:
 
