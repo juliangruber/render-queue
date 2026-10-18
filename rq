@@ -385,6 +385,38 @@ def snapshot():
             "finished": finished, "all_done": t if (current or queued) else now}
 
 
+def queue_view(jobs):
+    """The queue as waiting clients need it: both queues' order and what runs now (published in dispatcher.json)."""
+    grant = granted()
+    heavy = queue_order([j for j in jobs if j["status"] == "queued" and j.get("kind") != "light"
+                         and not has_flag(j["id"], "cancel")])
+    light = queue_order([j for j in jobs if j.get("kind") == "light" and j["status"] == "queued"
+                         and not has_flag(j["id"], "cancel")])
+    running = next((j for j in jobs if j["id"] == grant and j["status"] not in TERMINAL), None)
+    light_now = [j for j in jobs if j.get("kind") == "light" and j["status"] in ("granted", "running")]
+    brief = lambda j: {"project": j["project"], "name": j["name"]}
+    return {"main": [j["id"] for j in heavy], "light": [j["id"] for j in light],
+            "running": brief(running) if running else None, "light_running": [brief(j) for j in light_now]}
+
+
+def queue_place(job_id, light, cache):
+    """(position, what runs now) for a waiting job, from the dispatcher's published queue; from an old dispatcher
+    that doesn't publish it, a full snapshot at most every 15 s."""
+    d = dispatcher_state()
+    q = d.get("queue")
+    if q is None:
+        if time.time() - cache.get("at", 0) >= 15:
+            snap = snapshot()
+            cache.update(at=time.time(), q={"main": [j["id"] for j in snap["queued"]],
+                                            "light": [j["id"] for j in snap["light_queued"]],
+                                            "running": snap["running"], "light_running": snap["light"]})
+        q = cache.get("q") or {}
+    line = q.get("light" if light else "main") or []
+    position = line.index(job_id) + 1 if job_id in line else None
+    now = (q.get("light_running") or [None])[0] if light else q.get("running")
+    return position, now, d
+
+
 def queue_order(queued):
     first = read_json(ORDER, []) or []
     rank = {job_id: i for i, job_id in enumerate(first)}
@@ -418,6 +450,18 @@ def cwd_of(pid):
     return None
 
 
+def rq_pids():
+    """The processes of rq itself: waiting or running clients and the dispatcher (their jobs are other processes)."""
+    me = os.path.join(HOME, "rq")
+    out = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True).stdout
+    pids = set()
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and (me + " " in parts[1] or parts[1].endswith(me)):
+            pids.add(int(parts[0]))
+    return pids
+
+
 def strays(jobs=()):
     """Heavy work outside the queue, at normal priority (nice below QUIET_NICE), per process group: a busy or paused
     Blender or ffmpeg (an encoder waiting for frames counts while its pipeline works), or a project's group
@@ -435,9 +479,10 @@ def strays(jobs=()):
                 mine.add(p["pid"])
                 break
             q, seen = procs.get(q["ppid"]), seen + 1
+    ours = rq_pids()
     groups = {}
     for p in procs.values():
-        if p["pid"] in mine or "claude" in p["comm"].lower():
+        if p["pid"] in mine or p["pid"] in ours or "claude" in p["comm"].lower():
             continue
         groups.setdefault((p["pgid"], p["nice"] >= QUIET_NICE), []).append(p)
     found = {}
@@ -1156,6 +1201,11 @@ def cmd_daemon(args):
         except Exception as e:  # keep dispatching; show the error on the page
             state["note"] = "error: %r" % e
         try:
+            state["queue"] = queue_view(all_jobs())  # waiting clients read their place here, not every record
+        except Exception as e:
+            state.pop("queue", None)
+            state["queue_error"] = repr(e)
+        try:
             util, gpu_cores = gpu_sample()
             if util is not None:
                 samples = (state.get("gpu", {}).get("samples") or [])[-4:] + [util]  # the last 10 s
@@ -1251,7 +1301,7 @@ def cmd_run(args):
 
     say("%s %s" % ("light job, queued for the light slot:" if light else "queued", job["id"]))
     say("status page: http://localhost:%d" % (dispatcher_state().get("port") or PORT))
-    last, warned = None, False
+    last, warned, place_cache = None, False, {}
     turn_file = GRANT_LIGHT if light else GRANT
     while True:
         if has_flag(job["id"], "cancel"):
@@ -1262,15 +1312,11 @@ def cmd_run(args):
             return 130
         if granted(turn_file) == job["id"]:
             break
-        d = dispatcher_state()
+        position, r, d = queue_place(job["id"], light, place_cache)
         if not d["alive"] and not warned:
             say("warning: the rq dispatcher isn't running; still waiting (the queue session starts it with rq start)")
             warned = True
-        snap = snapshot()
-        line = snap["light_queued"] if light else snap["queued"]
-        position = next((i + 1 for i, j in enumerate(line) if j["id"] == job["id"]), None)
-        r = (snap["light"] or [None])[0] if light else snap["running"]
-        status = "waiting%s, position %s" % (" for the light slot" if light else "", position)
+        status = "waiting%s" % (" for the light slot" if light else "") + (", position %s" % position if position else "")
         if r:
             status += ", %s now: %s/%s" % ("light job" if light else "rendering", r["project"], r["name"])
         elif not light and d.get("note", "").startswith("waiting"):
@@ -1313,6 +1359,10 @@ def cmd_run(args):
 
 def other_work(job_id):
     """Work a long light job would hold up or compete with: a heavy job running or queued, or a light job waiting."""
+    q = dispatcher_state().get("queue")
+    if q is not None:  # the dispatcher's published queue: no need to read every record
+        return bool(q.get("running") or [i for i in q.get("main", []) if i != job_id]
+                    or [i for i in q.get("light", []) if i != job_id])
     for job in all_jobs():
         if job["id"] == job_id:
             continue
@@ -1327,6 +1377,7 @@ def cap_light(job_id, proc):
     """A light job that runs longer than LIGHT_CAP while other work is active (a heavy job, or a light job waiting)
     is paused and queued as a heavy job; it continues, with its progress, when it's its turn. Alone, it runs on.
     `rq keep ID` lets it run on in any case."""
+    place_cache = {}
     alone_said = False
     while proc.poll() is None:
         time.sleep(2)
@@ -1360,10 +1411,9 @@ def cap_light(job_id, proc):
                 os.killpg(proc.pid, signal.SIGCONT)
                 say("its turn: continuing")
                 return
-            snap = snapshot()
-            position = next((i + 1 for i, j in enumerate(snap["queued"]) if j["id"] == job_id), None)
+            position, _, _ = queue_place(job_id, False, place_cache)
             if position != last:
-                say("paused, waiting in the queue, position %s" % position)
+                say("paused, waiting in the queue" + (", position %s" % position if position else ""))
                 last = position
             time.sleep(TICK)
         return
