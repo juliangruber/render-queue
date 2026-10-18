@@ -6,7 +6,7 @@ low priority. A
 local status page shows the queue with expected start and end times, the CPU cores each project uses, the GPU load and
 which sessions are waiting for you.
 
-![The status page: sessions waiting for you, CPU and GPU use per project, the job rendering now next to a light job, the queue with expected start and end times, and recent jobs](docs/status.png)
+![The status page: sessions waiting for you, CPU and GPU use per project, the job rendering now next to a light job, the queue with expected start and end times, the light queue, and recent jobs with how many outputs each declared](docs/status.png)
 
 ## Setup
 
