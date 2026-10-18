@@ -52,7 +52,8 @@ tr:last-child td { border-bottom: none; }
 td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tag { font-size: 12px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); white-space: nowrap; }
 .tag.done { color: var(--ok); } .tag.failed, .tag.lost { color: var(--bad); } .tag.cancelled { color: var(--muted); }
-.tag.paused { color: var(--warn); }
+.tag.paused, .tag.unwatched { color: var(--warn); } .tag.unseen { color: var(--accent); }
+.why { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .empty { color: var(--muted); padding: 14px 16px; background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
 .warn { border-color: var(--warn); }
 .id { font: 11px ui-monospace, Menlo, monospace; color: var(--muted); word-break: break-all; }
@@ -74,9 +75,8 @@ tr.click { cursor: pointer; }
 tr.click:hover td, tr.click:focus-visible td { background: var(--code); }
 tr.click:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tile .pic:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.changed { color: var(--warn); }
 .out { color: var(--muted); font-size: 13px; white-space: nowrap; }
-/* the sheet: what a finished job produced */
+/* the sheet: what is at the outputs a job declared */
 #sheet[hidden], #lightbox[hidden] { display: none; }
 #sheet { position: fixed; inset: 0; z-index: 20; }
 .sheet-back { position: absolute; inset: 0; background: rgba(0,0,0,.5); }
@@ -110,6 +110,12 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
 .seq .frame img { max-width: 100%; max-height: 56vh; object-fit: contain; }
 .seq input[type=range] { width: 100%; margin: 10px 0 2px; }
 .note { color: var(--muted); font-size: 12px; margin-top: 22px; }
+.outs { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px 12px; }
+.outs .o { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; padding: 8px 0; }
+.outs .o + .o { border-top: 1px solid var(--line); }
+.outs code { font: 13px ui-monospace, Menlo, monospace; word-break: break-all; }
+.outs .missing { color: var(--warn); }
+.outs .acts { margin-top: 0; }
 #lightbox { position: fixed; inset: 0; z-index: 30; background: #0b0b0a; display: flex; flex-direction: column; }
 #lightbox .lb-img { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px; }
 #lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; }
@@ -167,7 +173,9 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 const $ = id => document.getElementById(id);
-// the tab icon: an old movie camera with two film reels; an amber dot while a session waits for you
+// the tab icon: an old movie camera with two film reels; an amber dot while a session waits for you (also one whose
+// turn ended while none of its tasks watches its jobs: the dispatcher lists them, and its results nobody has seen,
+// in the session's notes)
 const favicon = waiting => {
   const reel = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.2" fill="#e8e6e1"/>
     <circle cx="${cx}" cy="${cy}" r="1.4" fill="#1d1c1a"/>
@@ -197,11 +205,25 @@ const dur = s => {
   const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
   return h ? `${h}h${String(m).padStart(2, "0")}m` : m ? `${m}m` : `${s}s`;
 };
-// only the program a job runs (e.g. "blender"), never its arguments: skip cd steps, VAR=value and wrappers
-const WRAPPERS = new Set(["nice", "env", "caffeinate", "time", "exec", "nohup", "command"]);
-const SETUP = new Set(["cd", "set", "setopt", "export", "source", ".", "trap", "umask", "unset", "true",
-  "rm", "mkdir", "cp", "mv", "ln", "touch", "echo", "printf", ":"]);  // shell setup and file prep steps
-const SHELLS = new Set(["sh", "zsh", "bash"]);
+// how long a finished job ran, without the time it was paused or waiting in the queue; null if nobody saw it end
+// (its record was closed by the dispatcher). A dispatcher from before "took" existed: start to end.
+const took = j => "took" in j ? j.took : j.started && j.finished ? j.finished - j.started : null;
+// who sees a job. A task that watches it gets its output and exit code; stopping that task doesn't cancel the job.
+// Fields from the dispatcher; an older one has none of them, and then no tag shows.
+const SEEN_TIP = {
+  unwatched: "No task of the session that queued this job watches it, so that session gets no output or exit code when it ends (a terminal or another session following it doesn't count). Stopping a task doesn't cancel a job: rq cancel ID does, and rq wait ID follows it again.",
+  unseen: "Its result hasn't reached the session that queued it: no task of that session showed it. That session gets it with rq mine or rq wait ID.",
+  ended: " The session that queued it has no Claude process any more (archived or closed).",
+  owner: "Its rq supervisor ended without recording a result (killed or crashed). The job keeps its turn until its processes end; then it is recorded as lost.",
+};
+const seenTag = (kind, j) => ` <span class="tag ${kind}" title="${esc(SEEN_TIP[kind] + (j.session_ended ? SEEN_TIP.ended : ""))}">${kind}${j.session_ended ? " · session ended" : ""}</span>`;
+const seenTags = j => (j.owner_alive === false ? ` <span class="tag lost" title="${esc(SEEN_TIP.owner)}">supervisor gone</span>` : "")
+  + (j.unwatched ? seenTag("unwatched", j) : "") + (j.unseen ? seenTag("unseen", j) : "");
+// why a job ended as it did (lost, cancelled, failed: the dispatcher or its supervisor says), without "see rq log ID"
+const reasonText = j => j.reason && j.status !== "done" ? j.reason.replace(/\s*\(see rq log [^)]*\)/g, "") : "";
+const why = j => reasonText(j) ? `<div class="why">${esc(reasonText(j))}</div>` : "";
+// only the program a job runs (e.g. "blender"): rq works it out and never sends the command line itself
+const program = j => String(j.program || "");
 // small simplified logos in place of the program's name, for the programs most jobs run
 const ICONS = {
   Blender: `<svg viewBox="0 0 16 16" width="16" height="16" role="img" aria-label="Blender"><title>Blender</title>
@@ -221,36 +243,11 @@ const TOOL_NAMES = {blender: "Blender", python: "Python", ffmpeg: "FFmpeg"};
 const toolLogos = j => (j.tools || []).filter(t => TOOL_NAMES[t]).map(t =>
   `<span class="prog" title="${TOOL_NAMES[t]}">${ICONS[TOOL_NAMES[t]]}</span>`).join("");
 const programKind = p => /^blender$/i.test(p) ? "Blender" : (/^python[\d.]*$/i.test(p) || p === "py" || /\.py$/.test(p)) ? "Python" : null;
-const programLogo = cmd => { const k = programKind(program(cmd)); return k ? `<span class="prog" title="${k}">${ICONS[k]}</span>` : ""; };
+const programLogo = j => { const k = programKind(program(j)); return k ? `<span class="prog" title="${k}">${ICONS[k]}</span>` : ""; };
 // the queue table's tool column: the logo when there is one, else the program's name
-const programTool = j => toolLogos(j) || programLogo(j.command) || `<span class="sub">${esc(program(j.command))}</span>`;
-const programText = j => { const p = program(j.command); return p && !toolLogos(j) && !programKind(p) ? `<div class="id">${esc(p)}</div>` : ""; };
-const jobLogos = j => toolLogos(j) || programLogo(j.command);
-const UV_VALUE = new Set(["--with", "--project", "--python", "-p", "--directory", "--group", "--extra", "--env-file"]);
-const program = cmd => {
-  for (const part of String(cmd || "").split(/&&|\|\||;|\|/)) {
-    const words = part.trim().split(/\s+/).filter(Boolean);
-    let i = 0;
-    while (i < words.length) {
-      const w = words[i];
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || w.startsWith("-") || /^\d+$/.test(w) || WRAPPERS.has(w)) { i++; continue; }
-      break;
-    }
-    if (i >= words.length || SETUP.has(words[i].split("/").pop())) continue;
-    if (SHELLS.has(words[i].split("/").pop())) {  // a shell running a script: show the script
-      let k = i + 1;
-      while (k < words.length && words[k].startsWith("-") && words[k] !== "-c") k++;
-      if (k < words.length && words[k] !== "-c") i = k;
-    }
-    if (words[i] === "uv" && words[i + 1] === "run") {  // uv run [options] PROGRAM: show the program
-      i += 2;
-      while (i < words.length && words[i].startsWith("-")) i += UV_VALUE.has(words[i]) ? 2 : 1;
-      if (i >= words.length) return "uv";
-    }
-    return words[i].replace(/^["']|["']$/g, "").split("/").pop();
-  }
-  return "";
-};
+const programTool = j => toolLogos(j) || programLogo(j) || `<span class="sub">${esc(program(j))}</span>`;
+const programText = j => { const p = program(j); return p && !toolLogos(j) && !programKind(p) ? `<div class="id">${esc(p)}</div>` : ""; };
+const jobLogos = j => toolLogos(j) || programLogo(j);
 // a color per project: the sessions the dispatcher watches in name order, else the projects using cores; a project
 // keeps its color while the page is open
 const SLOTS = [];
@@ -265,10 +262,14 @@ function showWaiting(sessions) {
   const waiting = sessions.filter(x => !["working", "jobs"].includes(x.state)).sort((a, b) => (a.since || 0) - (b.since || 0));
   const working = sessions.filter(x => x.state === "working").map(x => x.project);
   const name = x => x.link ? `<a href="${esc(x.link)}" class="proj">${esc(x.project)}</a>` : `<span class="proj">${esc(x.project)}</span>`;
+  // what the session may not know: its project's jobs that no task watches (they won't wake it), results nobody has seen
+  const noteText = n => n.unwatched ? `${n.name} ${n.what}, ${n.elsewhere ? "no task of this session watches it" : "nobody watches it"}`
+    : `${n.name} ${n.what}${n.what === "failed" && n.exit != null ? " (exit " + n.exit + ")" : ""} at ${t(n.finished)}, nobody has seen the result`;
+  const notes = x => (x.notes || []).map(n => `<div class="why">${esc(noteText(n))}</div>`).join("");
   $("waiting").innerHTML = `<h2>Waiting for you</h2>${waiting.length ? `<table>
     <tr><th>Session</th><th>State</th><th>Since</th><th class="hide-sm">Background</th></tr>
     ${waiting.map(x => `<tr><td>${name(x)}</td>
-      <td>${x.state === "waiting" ? WAIT_LABEL[x.state] : `<span class="tag paused">${WAIT_LABEL[x.state]}${x.tool ? " · " + esc(x.tool) : ""}</span>`}</td>
+      <td>${x.state === "waiting" ? WAIT_LABEL[x.state] : `<span class="tag paused">${WAIT_LABEL[x.state]}${x.tool ? " · " + esc(x.tool) : ""}</span>`}${notes(x)}</td>
       <td class="num">${x.since ? day(x.since) + ` <span class="sub">(${dur(now - x.since)})</span>` : "?"}</td>
       <td class="hide-sm sub">${x.background ? x.background + " task" + (x.background > 1 ? "s" : "") + " running" : ""}</td></tr>`).join("")}</table>`
     : `<div class="empty">No session is waiting for you.</div>`}
@@ -331,7 +332,7 @@ async function refresh() {
     const over = r.expected && r.elapsed > r.expected;
     return `<div class="card">
       <div class="row"><span class="proj">${esc(r.project)}</span><span class="name">${esc(r.name)}</span>${jobLogos(r)}
-        ${r.paused ? '<span class="tag paused">paused</span>' : ""}</div>
+        ${r.paused ? '<span class="tag paused">paused</span>' : ""}${seenTags(r)}</div>
       <div class="bar ${over ? "over" : ""}"><div style="width:${r.expected ? pct : 100}%;${r.expected ? "" : "opacity:.25"}"></div></div>
       <div class="row sub"><span>started ${t(r.started)}</span><span>${dur(r.elapsed)} elapsed</span>
         <span>expected ${dur(r.expected)}</span><span>${r.eta ? (over ? "overdue since " : "done ~") + day(r.eta) : "no estimate"}</span></div>
@@ -340,7 +341,7 @@ async function refresh() {
   // light work runs next to the queue's job: same section, annotated, without a progress bar
   const lightCard = j => `<div class="card" style="margin-top:8px">
       <div class="row"><span class="proj">${esc(j.project)}</span><span class="name">${esc(j.name)}</span>${jobLogos(j)}
-        <span class="tag">light</span></div>
+        <span class="tag">light</span>${seenTags(j)}</div>
       <div class="row sub" style="margin-top:6px"><span>started ${t(j.started || j.submitted)}</span><span>${dur(j.elapsed)} elapsed</span></div>
       ${programText(j)}</div>`;
   $("running").innerHTML = (r || light.length) ? (r ? heavyCard(r) : `<div class="empty">No queued job is rendering.</div>`) + light.map(lightCard).join("")
@@ -357,21 +358,21 @@ async function refresh() {
 
   $("queue").innerHTML = s.queued.length ? `<table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th>
     <th>Expected</th><th>Start</th><th>Done</th></tr>${s.queued.map((j, i) => `<tr><td class="num">${i + 1}</td>
-    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ' <span class="tag paused" title="It ran longer than 5 min as light work while other work was waiting, so it was paused and moved into the queue">paused · was light</span>' : ""}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
+    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ' <span class="tag paused" title="It ran longer than 5 min as light work while other work was waiting, so it was paused and moved into the queue">paused · was light</span>' : ""}${seenTags(j)}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
     <td class="num">${dur(j.expected)}</td><td class="num">~${day(j.eta_start)}</td><td class="num">~${day(j.eta)}</td></tr>`).join("")}</table>`
     : `<div class="empty">Nothing waiting.</div>`;
   // the second queue: light jobs wait for the one light slot, independent of the main queue
   const lq = s.light_queued || [];
   $("queue").innerHTML += lq.length ? `<div class="sub" style="margin:14px 0 8px">Light queue · one light job at a time</div>
     <table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th></tr>
-    ${lq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">light</span></td>
+    ${lq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">light</span>${seenTags(j)}</td>
       <td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td></tr>`).join("")}</table>` : "";
 
   const recent = s.finished.length ? `<table><tr><th>Finished</th><th>Project</th><th>Job</th><th>Tool(s)</th><th>Took</th><th>Result</th><th class="hide-sm">Output</th></tr>
-    ${s.finished.slice(0, 10).map(j => `<tr class="click" data-job="${esc(j.id)}" tabindex="0" title="Show the pictures and videos it produced"><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" ? ' <span class="tag">light</span>' : ""}</td>
-    <td>${programTool(j)}</td><td class="num">${j.started && j.finished ? dur(j.finished - j.started) : "-"}</td>
-    <td><span class="tag ${esc(j.status)}">${esc(j.status)}${j.exit != null && j.status === "failed" ? " " + j.exit : ""}</span></td>
-    <td class="out hide-sm">${outputText(j, s.now)}</td></tr>`).join("")}</table>`
+    ${s.finished.slice(0, 10).map(j => `<tr class="click" data-job="${esc(j.id)}" tabindex="0" title="Show what is at the outputs it declared"><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" ? ' <span class="tag">light</span>' : ""}${why(j)}</td>
+    <td>${programTool(j)}</td><td class="num">${took(j) == null ? "-" : dur(took(j))}</td>
+    <td><span class="tag ${esc(j.status)}">${esc(j.status)}${j.exit != null && j.status === "failed" ? " " + j.exit : ""}</span>${seenTags(j)}</td>
+    <td class="out hide-sm">${outputText(j)}</td></tr>`).join("")}</table>`
     : `<div class="empty">No finished jobs yet.</div>`;
   if (recent !== refresh.recent) {  // rebuilding every 3 s would drop keyboard focus and swallow clicks
     const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest("#recent tr[data-job]");
@@ -381,14 +382,11 @@ async function refresh() {
 }
 
 
-// ---------- the sheet: what a finished job produced ----------
-const ARTIFACT_DAYS = 2;  // the dispatcher looks for files of jobs this recent; older ones when their sheet opens
-const outputText = (j, now) => {
-  if (!j.started) return "";
-  if (!j.artifacts) return now - (j.finished || 0) < ARTIFACT_DAYS * 86400 ? "…" : "";
-  return j.artifacts.count ? `${j.artifacts.count} file${j.artifacts.count > 1 ? "s" : ""}` : "-";
-};
+// ---------- the sheet: what is at the outputs a job declared ----------
+// how many outputs a job declared (rq run --output), "none" if it said it writes none, nothing for older jobs
+const outputText = j => j.no_output ? "none" : j.output_count ? `${j.output_count} output${j.output_count > 1 ? "s" : ""}` : "";
 const size = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? Math.round(b / 1e3) + " KB" : b + " B";
+const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 let sheet = null;  // {job, pictures: [artifact], lb: index, opener: job id}
 const byKey = key => sheet && sheet.job.artifacts.find(a => a.key === key);
 const fileUrl = (a, frame) => `/api/file/${encodeURIComponent(sheet.job.id)}/${a.key}${frame != null ? "/" + frame : ""}?v=${Math.round(a.mtime)}`;
@@ -397,7 +395,7 @@ const toast = text => { const el = $("toast"); el.textContent = text; el.style.d
 async function onMac(how, key, frame) {
   try {
     const r = await fetch(`/api/${how}/${encodeURIComponent(sheet.job.id)}/${key}${frame != null ? "/" + frame : ""}`, {method: "POST"});
-    toast(r.ok ? (how === "open" ? "Opened on the Mac" : "Shown in the Finder") : "The file isn't there any more");
+    toast(r.ok ? (how === "open" ? "Opened on the Mac" : "Shown in the Finder") : "It isn't there any more");
   } catch (e) { toast("The status page is offline"); }
 }
 // buttons for a file: open it on the Mac with its usual app, show it in the Finder, the file itself in a new tab
@@ -407,21 +405,33 @@ const acts = (a, frame, inBrowser) => `<div class="acts">
   ${inBrowser ? `<a href="${fileUrl(a, frame)}" target="_blank" rel="noopener">full file ↗</a>` : ""}</div>`;
 // a sequence's frames: ranges of numbers, picked by position
 const frameAt = (a, i) => { for (const [lo, hi] of a.frames) { if (i <= hi - lo) return lo + i; i -= hi - lo + 1; } return a.frames[a.frames.length - 1][1]; };
-const frameName = (a, f) => a.name.replace(/#+/, a.width ? String(f).padStart(a.width, "0") : String(f));
-const changedNote = a => a.changed ? ' <span class="changed">changed since this job</span>' : "";
+const frameName = (a, f) => a.prefix + (a.width ? String(f).padStart(a.width, "0") : String(f)) + a.suffix;
 const cantShow = a => `${esc(a.ext.slice(1).toUpperCase())}: this browser can't show it`;
 const fileCard = (a, why) => `<div class="tile file"><div class="pic">${why}</div>
-  <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}${changedNote(a)}</div>${a.exists ? acts(a, null, false) : ""}</div></div>`;
+  <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}</div>${acts(a, null, false)}</div></div>`;
 const AUTOLOAD_VIDEOS = 3;  // more at once can stall a browser's connections to the page (Firefox)
 
+// one line per declared output: its path in the project, and what is there now
+const KIND_WORD = {file: "file", folder: "folder", pattern: "frame pattern"};
+function outputState(o) {
+  if (o.state === "missing") return o.kind === "pattern" ? "no frames there" : "not there";
+  if (o.state === "refused") return o.kind === "folder" ? "not a folder in the project" : "not a picture or video file in the project";
+  if (o.state === "empty") return o.kind === "pattern" ? "no frames there" : "nothing the page can show there";
+  if (o.kind === "pattern") return o.videos ? count(o.videos, "video", "videos") : `${count(o.frames, "frame", "frames")}, ${o.first} to ${o.last}`;
+  if (o.kind === "file") return "here";
+  return [o.videos && count(o.videos, "video", "videos"), o.pictures && count(o.pictures, "picture", "pictures"),
+          o.sequences && count(o.sequences, "frame sequence", "frame sequences")].filter(Boolean).join(", ");
+}
+const outputRow = o => `<div class="o"><code>${esc(o.path)}</code><span class="sub${o.state === "here" ? "" : " missing"}">${KIND_WORD[o.kind] || esc(o.kind)} · ${outputState(o)}</span>
+  ${o.kind === "folder" && o.state !== "missing" && o.state !== "refused" ? `<div class="acts"><button data-mac="reveal" data-key="${o.key}">Show in Finder</button></div>` : ""}</div>`;
+
 function videoCard(a, i) {
-  if (!a.exists) return `<div class="vid"><div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · gone since</span></div></div>`;
   const player = i < AUTOLOAD_VIDEOS
     ? `<video controls preload="metadata" playsinline src="${fileUrl(a)}"></video>`
     : `<video controls preload="none" playsinline data-src="${fileUrl(a)}" hidden></video>
        <button data-load="${a.key}">▶ Load video</button>`;
   return `<div class="vid" data-key="${a.key}">${player}
-    <div class="fname" style="margin-top:8px">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${size(a.size)}</span>${changedNote(a)}</div>${acts(a, null, true)}</div>`;
+    <div class="fname" style="margin-top:8px">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${size(a.size)}</span></div>${acts(a, null, true)}</div>`;
 }
 
 // a video this browser can't play (e.g. ProRes outside Safari): a note and the Mac buttons instead
@@ -442,26 +452,32 @@ function renderSheet(v) {
   $("sheet-title").innerHTML = `<span class="proj">${esc(v.project)}</span><span class="name">${esc(v.name)}</span>${v.kind === "light" ? ' <span class="tag">light</span>' : ""}
     ${jobLogos(v)} <span class="tag ${esc(v.status)}">${esc(v.status)}${v.exit != null && v.status === "failed" ? " " + v.exit : ""}</span>`;
   $("sheet-meta").textContent = v.pending ? (v.started ? `running since ${day(v.started)}` : "waiting in the queue")
-    : v.started ? `${day(v.started)} to ${day(v.finished)} · took ${dur(v.finished - v.started)}` : "never started";
-  if (v.pending) {
-    $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">This job hasn't finished yet. Its pictures and videos show up here a few seconds after it ends.</div>`;
+    : (v.started ? `${day(v.started)} to ${day(v.finished)}${took(v) == null ? "" : " · took " + dur(took(v))}` : "never started")
+      + (v.reason && v.status !== "done" ? " · " + v.reason : "");
+  if (v.no_output) {
+    $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">This job writes no pictures or videos: its session said so when it queued it.</div>`;
+    return;
+  }
+  if (!v.declared) {
+    $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">No outputs were declared for this job, so there is nothing to show.</div>`;
     return;
   }
   const videos = v.artifacts.filter(a => a.kind === "video"), pictures = v.artifacts.filter(a => a.kind === "image"),
         seqs = v.artifacts.filter(a => a.kind === "sequence");
-  sheet.pictures = pictures.filter(a => a.browser && a.exists);
-  let out = "";
+  sheet.pictures = pictures.filter(a => a.browser);
+  // a job that never ran wrote none of it: what is there comes from other work at the same paths
+  let out = !v.started ? `<div class="note" style="margin-top:16px">${v.pending ? "This job hasn't started yet" : "This job never ran"}: anything shown here was written at these paths by other work, not by this job.</div>`
+    : v.pending ? `<div class="note" style="margin-top:16px">This job hasn't finished yet: this is what is at its outputs so far.</div>` : "";
+  out += `<h3>Outputs · ${v.outputs.length}</h3><div class="outs">${v.outputs.map(outputRow).join("")}</div>`;
   if (videos.length) out += `<h3>Videos · ${videos.length}</h3>` + videos.map(videoCard).join("");
-  if (pictures.length) out += `<h3>Pictures · ${pictures.length}</h3><div class="grid">` + pictures.map(a => !a.exists
-    ? `<div class="tile file"><div class="pic">gone since</div><div class="cap"><div class="fname">${esc(a.name)}</div></div></div>`
-    : !a.browser ? fileCard(a, `${esc(a.ext.slice(1).toUpperCase())}: browsers can't show this`)
+  if (pictures.length) out += `<h3>Pictures · ${pictures.length}</h3><div class="grid">` + pictures.map(a => !a.browser
+    ? fileCard(a, `${esc(a.ext.slice(1).toUpperCase())}: browsers can't show this`)
     : `<div class="tile" data-key="${a.key}"><div class="pic" data-lb="${a.key}" tabindex="0" role="button" aria-label="Show ${esc(a.name)} full size"><img loading="lazy" decoding="async" src="${fileUrl(a)}" alt="${esc(a.name)}"></div>
-        <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}${changedNote(a)}</div></div></div>`).join("") + "</div>";
+        <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}</div></div></div>`).join("") + "</div>";
   if (seqs.length) out += `<h3>Frame sequences · ${seqs.length}</h3>` + seqs.map(a => {
     const first = a.frames[0][0], last = a.frames[a.frames.length - 1][1];
-    const head = `<div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${a.count} frames, ${first} to ${last} · ${size(a.size)}</span></div>`;
+    const head = `<div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${count(a.count, "frame", "frames")}, ${first} to ${last} · ${size(a.size)}</span></div>`;
     const folder = `<div class="acts"><button data-mac="open" data-key="${a.key}">Open folder on Mac</button><button data-mac="reveal" data-key="${a.key}">Show in Finder</button></div>`;
-    if (!a.exists) return `<div class="seq">${head}<div class="sub">gone since</div></div>`;
     if (!a.browser) return `<div class="seq">${head}<div class="sub" style="margin-top:6px">${esc(a.ext.slice(1).toUpperCase())}: browsers can't show these frames</div>${folder}</div>`;
     return `<div class="seq" data-seq="${a.key}">${head}
       <div class="frame"><img alt="" src="${fileUrl(a, first)}"></div>
@@ -469,10 +485,9 @@ function renderSheet(v) {
       <div class="acts"><button data-step="-1" aria-label="Previous frame">‹</button><button data-step="1" aria-label="Next frame">›</button>
         <span class="sub" data-label>${esc(frameName(a, first))} · 1 of ${a.count}</span></div>${folder}</div>`;
   }).join("");
-  if (!v.artifacts.length) out += `<div class="empty" style="margin-top:18px">${v.started ? "No pictures or videos found for this job." : "This job never started."}</div>`;
   if (v.truncated) out += `<div class="note">${v.truncated} more pictures or videos aren't shown.</div>`;
-  if (v.started) out += `<div class="note">Pictures and videos that changed in ${esc(v.project)}'s folder and its scratch folders while this job ran.
-    Files written by other work at the same time can show up here too.</div>`;
+  if (v.partial) out += `<div class="note">A declared folder holds more than the sheet looks through, so not all of it is shown.</div>`;
+  if (v.started && !v.pending) out += `<div class="note">This is what is at the paths this job declared, as of now: what was written there after it ended shows too, and what was removed since doesn't.</div>`;
   $("sheet-body").innerHTML = out;
   $("sheet-body").querySelectorAll(".vid video").forEach(watchVideo);
   // a picture this browser can't show (e.g. TIFF outside Safari): a note and the Mac buttons instead
@@ -514,7 +529,7 @@ async function openSheet(id, opener) {
   sheet = {job: {id, artifacts: []}, pictures: [], opener: opener || (sheet && sheet.opener)};
   $("sheet").hidden = false; document.body.style.overflow = "hidden";
   $("sheet-title").textContent = ""; $("sheet-meta").textContent = "";
-  $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">Looking for the pictures and videos it produced…</div>`;
+  $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">Looking at its outputs…</div>`;
   if (location.hash !== "#job=" + id) history.replaceState(null, "", "#job=" + id);
   $("sheet-close").focus();
   try {

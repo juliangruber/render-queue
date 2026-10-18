@@ -2,13 +2,20 @@
 """rq: one render queue for several Claude Code sessions on one Mac.
 
 Strictly one heavy job at a time, first come first served. A session submits a
-heavy job with `rq run`, which waits for its turn, runs the command itself
-(so the session's environment, cwd and sandbox apply), streams its output live
-and exits with the job's exit code. The dispatcher (`rq daemon`) only decides
+heavy job with `rq run`. That starts the job's own rq supervisor, detached from
+the session but with its environment, cwd and sandbox, which waits for the
+job's turn, runs it and records the result. `rq run` itself only watches: it
+streams the job's output live and exits with the job's exit code. Stopping it
+(or the session ending) does not stop the job; `rq cancel ID` does, and
+`rq wait ID` watches a job again. The dispatcher (`rq daemon`) only decides
 whose turn it is and serves the status page.
 
-  rq run --name NAME [--project P] [--estimate 90m] -- COMMAND [ARGS...]
-  rq light --name NAME [--project P] -- COMMAND [ARGS...]   (light work: the light queue, one at a time, at nice 10)
+  rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90m] [--detach]
+         [--again | --replace] -- COMMAND [ARGS...]
+  rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace]
+         -- COMMAND [ARGS...]   (light work: the light queue, one at a time, at nice 10)
+  rq wait ID [-n LINES]     (watch a job again: its output from here, then its exit code; at once if it ended)
+  rq mine [--unwatched] [--hook]   (this session's jobs no task of it watches, results that didn't reach it)
   rq status [--json]
   rq log ID [-n LINES] [-f]
   rq cancel ID | rq pause ID | rq resume ID
@@ -19,10 +26,32 @@ whose turn it is and serves the status page.
   rq start [--port 8642]    (start the dispatcher and status page detached, once per machine)
   rq daemon [--port 8642]   (the same in the foreground)
 
-A single COMMAND argument runs through /bin/zsh -c, several run as argv.
+A single COMMAND argument runs through /bin/zsh -c, several run as argv. Every
+job says where it writes its pictures and videos: --output PATH (-o), repeated
+for several, each a file, a folder (ending in /) or a frame pattern
+(renders/####.png, %04d, %d: with the zero padding the job writes), relative
+to the current folder and inside the project's folder or its Claude Code
+scratchpads (symlinks resolved); or --no-output. The status page shows what is
+at those paths when a job's sheet is opened. An identical job (same project,
+name, folder and command) that is still queued or running and that no task of
+its session watches is not submitted again (if only its outputs differ, it
+takes this call's): --again queues another copy, --replace first cancels the
+project's jobs of that name. A job of that name from another folder or with
+another command gets a note.
+
+rq run and rq wait exit with: 0 done; the job's code if it failed, 128+n if
+signal n ended it (also when it was cancelled while running, e.g. 143); 130
+cancelled before it ran; 75 lost; 129 the session it reported to ended while
+it watched; 128+n when the watcher itself got signal n (143 for a TaskStop,
+the job carries on; the last line says which); 141 nobody read its output any
+more. rq run refuses with (nothing was queued): 64 no --output and no
+--no-output, both, an --output outside the project or not a picture or video,
+or a --project that isn't one folder name; 65 an identical job is still queued or running and unwatched; 69 an
+older dispatcher runs. 70: the job's supervisor could not start. --detach
+exits 0 once the job is submitted.
 """
 import argparse
-import bisect
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -32,6 +61,8 @@ import mimetypes
 import os
 import random
 import re
+import select
+import shutil
 import signal
 import socket
 import stat
@@ -41,6 +72,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.dirname(os.path.realpath(__file__))
@@ -48,7 +80,8 @@ STATE = os.environ.get("RQ_STATE", os.path.join(HOME, "state"))
 JOBS = os.path.join(STATE, "jobs")
 LOGS = os.path.join(STATE, "logs")
 FLAGS = os.path.join(STATE, "flags")
-ARTIFACTS = os.path.join(STATE, "artifacts")  # per job: the pictures and videos it produced
+OWNERS = os.path.join(STATE, "owners")  # per job: ID.lock, flocked by whoever owns the job (from submission on)
+WATCH = os.path.join(STATE, "watch")  # per watcher: ID.PID.json, flocked by the rq run / rq wait that watches ID
 GRANT = os.path.join(STATE, "grant")
 GRANT_LIGHT = os.path.join(STATE, "grant-light")  # the light queue's turn: one light job at a time
 ORDER = os.path.join(STATE, "order.json")
@@ -63,12 +96,19 @@ GROUP_HEAVY_CPU = 80  # a project's process group using this much CPU (%) outsid
 LIGHT_CAP = int(os.environ.get("RQ_LIGHT_CAP", 300))  # applies only while other work is active (other_work)  # seconds a light job may run; then it is paused and moved into the queue (rq keep ID exempts it)
 QUIET_WINDOW = int(os.environ.get("RQ_QUIET_WINDOW", 120))  # seconds without outside work before the next job starts (bridges gaps between steps)
 TERMINAL = ("done", "failed", "cancelled", "lost")
+RQ_PATH = os.path.realpath(__file__)
+PROTO = 2  # the dispatcher's protocol: 2 = it judges v2 jobs by their owner lock and writes records only by merging
+CANCEL_KILL = float(os.environ.get("RQ_CANCEL_KILL", 30))  # seconds from a cancel to SIGKILL of a job that still runs
+STOP_KILL = float(os.environ.get("RQ_STOP_KILL", 10))  # the same after its supervisor got SIGTERM (logout, shutdown)
+START_WAIT = 10  # seconds rq run waits for the job's supervisor to take it over
+LOST_AFTER = 10  # seconds a watcher waits on a job without owner or processes before it reports it lost
+TEST_DISPATCH_DELAY = float(os.environ.get("RQ_TEST_DISPATCH_DELAY") or 0)  # tests only: stale reads in the dispatcher
 
 
 # ---------- files ----------
 
 def setup():
-    for d in (JOBS, LOGS, FLAGS, ARTIFACTS):
+    for d in (JOBS, LOGS, FLAGS, OWNERS, WATCH):
         os.makedirs(d, exist_ok=True)
 
 
@@ -99,13 +139,68 @@ def save_job(job):
     write_json(job_path(job["id"]), job)
 
 
+# A flock belongs to an open file, so a thread that holds it (or a signal handler running in that thread) must not
+# open and lock the file again: it would wait for itself. The thread's depth says it holds it already.
+_jobs_lock = threading.RLock()
+_jobs_lock_depth = threading.local()
+
+
+@contextlib.contextmanager
+def jobs_lock():
+    """Every read-modify-write of a job record runs under state/jobs.lock, across processes and threads."""
+    with _jobs_lock:
+        depth = getattr(_jobs_lock_depth, "n", 0)
+        _jobs_lock_depth.n = depth + 1
+        fd = None
+        try:
+            if depth == 0:
+                fd = os.open(os.path.join(STATE, "jobs.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            _jobs_lock_depth.n = depth
+            if fd is not None:
+                os.close(fd)
+
+
+def update_job(job_id, only_if=None, **changes):
+    """Change a job's record under the jobs lock: re-read it, check only_if(record), merge the changes (a callable
+    value gets the record as it was read) and write it. Returns the new record, or None if the record is gone or
+    only_if said no, so a stale copy can never overwrite what another process wrote meanwhile."""
+    with jobs_lock():
+        job = load_job(job_id)
+        if not job or (only_if and not only_if(job)):
+            return None
+        read = dict(job)
+        for key, value in changes.items():
+            job[key] = value(read) if callable(value) else value
+        save_job(job)
+        return job
+
+
+_jobs_cache = {}  # record file name -> ((mtime_ns, size, inode), the record as read)
+
+
 def all_jobs():
-    jobs = []
-    for name in os.listdir(JOBS):
-        if name.endswith(".json"):
-            job = read_json(os.path.join(JOBS, name))
+    """Every job record, each call its own copies. A record is only ever replaced whole (write_json renames a new
+    file over it), so one whose mtime, size and inode haven't changed since the last call is not parsed again."""
+    global _jobs_cache
+    seen, jobs = {}, []
+    with os.scandir(JOBS) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            key = (st.st_mtime_ns, st.st_size, st.st_ino)
+            hit = _jobs_cache.get(entry.name)
+            job = hit[1] if hit and hit[0] == key else read_json(entry.path)
             if job:
-                jobs.append(job)
+                seen[entry.name] = (key, job)
+                jobs.append(dict(job))
+    _jobs_cache = seen
     return jobs
 
 
@@ -122,7 +217,19 @@ def set_flag(job_id, kind, on=True):
     if on:
         open(path, "w").close()
     elif os.path.exists(path):
-        os.remove(path)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def clear_flags(job_id):
+    """A job that ended needs none of its flags."""
+    for kind in ("cancel", "paused", "keep"):
+        try:
+            set_flag(job_id, kind, False)
+        except OSError:
+            pass
 
 
 def granted(path=GRANT):
@@ -153,6 +260,11 @@ def alive(pid):
         return True
 
 
+def group_members(pgid):
+    """The processes of a process group that are not zombies."""
+    return [p for p in processes().values() if p["pgid"] == pgid and not p["stat"].startswith("Z")]
+
+
 def group_alive(pgid):
     if not pgid:
         return False
@@ -161,8 +273,339 @@ def group_alive(pgid):
         return True
     except ProcessLookupError:
         return False
-    except PermissionError:
+    except PermissionError:  # macOS says EPERM for a group that holds only zombies
+        return bool(group_members(pgid))
+
+
+def signal_group(pgid, *sigs):
+    """Send signals to a job's process group. Returns False if the group is gone or holds only zombies (macOS
+    answers EPERM for those, e.g. a job killed with its session but not reaped yet), True once they were sent.
+    Raises PermissionError only if live members are left that may not be signalled."""
+    if not pgid:
+        return False
+    for sig in sigs:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            if group_members(pgid):
+                raise
+            return False
+    return True
+
+
+def proc_start(pid):
+    """A process's start time as ps prints it: with its pid, it tells a process from a later one that got its pid."""
+    if not pid:
+        return None
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout.strip()
+    except OSError:
+        return None
+    return out or None
+
+
+def proc_starts():
+    """{pid: start time, as proc_start() gives it} of every process, with one ps."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,lstart="], capture_output=True, text=True,
+                             env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout
+    except OSError:
+        return {}
+    starts = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            starts[int(parts[0])] = parts[1].strip()
+    return starts
+
+
+_boot = {}
+
+
+def sysctl(name):
+    try:  # (by its full path: a PATH without /usr/sbin must not turn off the boot check)
+        return subprocess.run(["/usr/sbin/sysctl", "-n", name], capture_output=True, text=True).stdout.strip() or None
+    except OSError:
+        return None
+
+
+def boot_id():
+    """This boot of the Mac (kern.bootsessionuuid; RQ_BOOT_ID in tests)."""
+    if "id" not in _boot:
+        _boot["id"] = os.environ.get("RQ_BOOT_ID") or sysctl("kern.bootsessionuuid")
+    return _boot["id"]
+
+
+def boot_time():
+    if "time" not in _boot:
+        m = re.search(r"sec = (\d+)", sysctl("kern.boottime") or "")
+        _boot["time"] = int(m.group(1)) if m else None
+    return _boot["time"]
+
+
+def from_earlier_boot(job):
+    """A record from before the Mac last started: its pids and process groups belong to other processes now, so
+    rq never signals them."""
+    if job.get("boot"):
+        return bool(boot_id()) and job["boot"] != boot_id()
+    return bool(boot_time()) and (job.get("submitted") or 0) < boot_time()
+
+
+def job_group(job):
+    """The process group of a job's processes while it is still theirs, else None: no pgid, a record from before
+    the Mac restarted, or no live member left. A group whose leader's pid now belongs to a process that started at
+    another time than the job (job_start) is another group: macOS never hands out a pid that is still a group's id,
+    so a live leader with another start time means the job's group ended and its pid was given to someone else.
+    A leader that is gone while members remain is still the job's group, and so is a record without job_start (an
+    older rq, or the job ended before rq looked). Every signal rq sends to a job it doesn't own goes through this."""
+    pgid = job.get("pgid")
+    if not pgid or from_earlier_boot(job) or not group_alive(pgid):
+        return None
+    if job.get("job_start"):
+        start = proc_start(pgid)
+        if start and start != job["job_start"]:
+            return None
+    return pgid
+
+
+def owner_lock(job_id):
+    return os.path.join(OWNERS, job_id + ".lock")
+
+
+def lock_held(path):
+    """True while some process holds the flock on a lock file; False once it is free or gone (no O_CREAT)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
         return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def owner_alive(job):
+    """Whether a job still has its owner. A v2 job: its rq supervisor holds state/owners/ID.lock (rq run takes it
+    before the record exists and hands it over, so there is no gap, and reused pids or a restart can't fool it).
+    An older record: the pid of its rq client, which ran the job itself."""
+    if (job.get("v") or 1) >= 2:
+        return lock_held(owner_lock(job["id"]))
+    return alive(job.get("client_pid"))
+
+
+def drop_stale_lock(job_id):
+    """Remove the lock file of a job nobody owns any more (only once rq holds it itself)."""
+    path = owner_lock(job_id)
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.unlink(path)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def claude_pid():
+    """The Claude Code process this one runs under: CLAUDE_PID, if that process is an ancestor (a stale value, as
+    a job's own commands inherit it, is ignored)."""
+    try:
+        pid = int(os.environ.get("CLAUDE_PID") or 0) or None
+    except ValueError:
+        return None
+    if not pid:
+        return None
+    try:
+        procs = processes()
+    except Exception:
+        return pid
+    p, seen = procs.get(os.getpid()), 0
+    while p and seen < 64:
+        if p["pid"] == pid:
+            return pid
+        p, seen = procs.get(p["ppid"]), seen + 1
+    return None
+
+
+def output_path(fd=1):
+    """The file this process's output goes to (a background task's output file), or None for a pipe or terminal."""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode() or None
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def session_alive(info, check_start=True, starts=None):
+    """Whether the Claude Code process a watcher or submission reported to still runs (true if it named none).
+    starts: proc_starts(), to look many up with one ps."""
+    pid = info.get("claude_pid")
+    if not pid:
+        return True
+    if starts is not None:
+        start = starts.get(pid)
+        return bool(start) and (not check_start or not info.get("claude_start") or start == info["claude_start"])
+    if not alive(pid):
+        return False
+    if not check_start or not info.get("claude_start"):
+        return True
+    start = proc_start(pid)  # None: ps failed (e.g. no fork under a heavy render), which says nothing
+    return start is None or start == info["claude_start"]
+
+
+def watch_files(job_id):
+    return glob.glob(os.path.join(WATCH, glob.escape(job_id) + ".*.json"))
+
+
+def live_watchers(job, starts=None):
+    """The live watchers of a job, as their watch files describe them (pid, session_id, claude_pid, ...): rq run or
+    rq wait processes that hold their watch file's lock, while the Claude Code session they report to runs. An
+    older record's own client watches it too ({"v1": True}: its session is unknown)."""
+    found = []
+    for path in watch_files(job["id"]):
+        if lock_held(path):
+            info = read_json(path, {}) or {}
+            if session_alive(info, starts=starts):
+                found.append(info)
+    if (job.get("v") or 1) < 2 and alive(job.get("client_pid")):
+        found.append({"v1": True})
+    return found
+
+
+def watchers(job, starts=None):
+    """How many live watchers a job has (see live_watchers)."""
+    return len(live_watchers(job, starts))
+
+
+def watches_for(info, session_id):
+    """Whether a live watcher is a task of that Claude Code session: the same session id, or a session that
+    doesn't say its id (an older Claude Code, an older rq client). A watcher outside Claude Code (a terminal)
+    is no session's task."""
+    if info.get("session_id"):
+        return info["session_id"] == session_id
+    return bool(info.get("claude_pid") or info.get("v1"))
+
+
+def submitter_sid(job):
+    return (job.get("submitter") or {}).get("session_id")
+
+
+def own_watchers(job, starts=None):
+    """The live watchers that report to the session that queued the job: only they tell that session its output
+    and exit code. A terminal or another session following the job doesn't. A job without a session id (queued
+    from a terminal, by an older rq or an older Claude Code): every live watcher."""
+    sid = submitter_sid(job)
+    return [w for w in live_watchers(job, starts) if not sid or watches_for(w, sid)]
+
+
+def session_gone(job, claude, watching, starts):
+    """Whether the Claude Code session that submitted a job has ended (archived or closed): True if no Claude
+    process runs that session id any more, False if one does, None if rq can't tell (the job came from outside
+    Claude Code or an older rq, or no dispatcher looked at the processes). A resumed session keeps its id but not
+    its pid, so the pid only ever proves that it still runs. claude: what the dispatcher found (claude_scan);
+    watching: the session ids of live watchers."""
+    sub = job.get("submitter") or {}
+    sid = sub.get("session_id")
+    if sub.get("claude_pid") and session_alive(sub, starts=starts):
+        return False  # the very process that submitted it
+    if not sid:
+        return None
+    if sid in watching:
+        return False  # a task of that session watches one of rq's jobs
+    if not claude:
+        return None
+    if sid in claude.get("ids", ()):
+        return False
+    if job.get("project") in claude.get("fresh", ()):
+        return None  # a session there runs without its id on its command line (claude started without --resume)
+    return True
+
+
+def append_note(path, text):
+    """Best effort: a line at the end of a dead task's output file, which its session may read again later."""
+    try:
+        if not path or not stat.S_ISREG(os.stat(path).st_mode):
+            return False
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return False
+    try:
+        os.write(fd, ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text)).encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def file_tail(path, size=2048):
+    if not path:  # (a watcher whose output was a terminal or a pipe has no output file)
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - size))
+            return f.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def detach(argv, out_path, keep_fd=None):
+    """Start argv detached: fork, setsid, fork again, so it runs with launchd as its parent in a session of its own,
+    out of reach of whatever kills the caller's process group and descendants. It keeps the caller's environment,
+    cwd and sandbox. stdin is /dev/null, stdout and stderr append to out_path, and every other fd is closed except
+    keep_fd. Returns its pid, or None if it could not be started."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            os.setsid()
+            child = os.fork()
+            if child:
+                os.write(w, b"%d" % child)
+                os._exit(0)
+            out = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            null = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(null, 0)
+            os.dup2(out, 1)
+            os.dup2(out, 2)
+            top = os.sysconf("SC_OPEN_MAX")
+            top = 4096 if top <= 0 else min(top, 65536)
+            if keep_fd is None:
+                os.closerange(3, top)
+            else:
+                os.closerange(3, keep_fd)
+                os.closerange(keep_fd + 1, top)
+                os.set_inheritable(keep_fd, True)
+            os.execv(argv[0], argv)
+        except BaseException as e:
+            try:
+                os.write(2, ("rq: could not start %s: %r\n" % (" ".join(argv[1:3]), e)).encode())
+            except BaseException:
+                pass
+        os._exit(127)
+    os.close(w)
+    data = b""
+    while True:
+        chunk = os.read(r, 64)
+        if not chunk:
+            break
+        data += chunk
+    os.close(r)
+    os.waitpid(pid, 0)
+    return int(data) if data.strip().isdigit() else None
 
 
 def parse_duration(text):
@@ -195,8 +638,37 @@ def dashed(name):
     return re.sub(r"[^A-Za-z0-9]", "-", name)
 
 
+_linked = {"at": 0, "found": []}
+
+
+def linked_projects():
+    """The project folders that are symlinks in ROOT to a folder elsewhere (a project on another disk linked into
+    the projects folder), as (name, real path), the longest real path first. Looked at again after 5 s (the
+    dispatcher asks for every process's folder)."""
+    now = time.time()
+    if now - _linked["at"] < 5:
+        return _linked["found"]
+    found = []
+    try:
+        names = os.listdir(ROOT)
+    except OSError:
+        names = []
+    for n in names:
+        link = os.path.join(ROOT, n)
+        if n == SELF or not os.path.islink(link):
+            continue
+        real = os.path.realpath(link)
+        # not a link to the projects folder or above it (that would take in every path), nor into it (by name)
+        if os.path.isdir(real) and not inside(ROOT, [real]) and not inside(real, [ROOT]):
+            found.append((n, real))
+    found.sort(key=lambda nr: -len(nr[1]))
+    _linked.update(at=now, found=found)
+    return found
+
+
 def project_of(path):
-    """The project a path belongs to: its folder under ROOT, or its Claude Code scratchpad."""
+    """The project a path belongs to: its folder under ROOT (also as the real path of a project folder that is a
+    symlink in ROOT), or its Claude Code scratchpad."""
     if not path:
         return None
     m = re.search(re.escape(ROOT) + r"/([^/]+)", path)
@@ -204,7 +676,8 @@ def project_of(path):
         return m.group(1)
     m = re.search(re.escape(ROOT_DASHED) + r"-([^/]+?)/", path + "/")
     if not m:
-        return None
+        # a project folder linked into ROOT: the session's folder is its real path (getcwd resolves symlinks)
+        return next((n for n, real in linked_projects() if inside(path, [real])), None)
     name = m.group(1)
     try:  # the dashed name back to its folder (my.film -> my-film -> my.film), also from a session in a subfolder
         return max((n for n in os.listdir(ROOT) if name == dashed(n) or name.startswith(dashed(n) + "-")),
@@ -272,6 +745,39 @@ def program_words(text):
             yield words[i], words[i + 1:]
 
 
+PAGE_WRAPPERS = {"nice", "env", "caffeinate", "time", "exec", "nohup", "command"}
+PAGE_SETUP = {"cd", "set", "setopt", "export", "source", ".", "trap", "umask", "unset", "true", "rm", "mkdir", "cp",
+              "mv", "ln", "touch", "echo", "printf", ":"}  # shell setup and file prep steps
+
+
+def program_of(command):
+    """The program a job runs, as the page shows it (e.g. "blender", or the script a shell runs), never its
+    arguments or folders: the first command of the line that isn't shell setup, with wrappers, VAR=value and
+    options skipped. Worked out here, so the page never gets the command line."""
+    for part in re.split(r"&&|\|\||;|\|", command or ""):
+        words = part.split()
+        i = 0
+        while i < len(words) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]) or words[i].startswith("-")
+                                  or re.match(r"^[0-9]+$", words[i]) or words[i] in PAGE_WRAPPERS):
+            i += 1
+        if i >= len(words) or words[i].split("/")[-1] in PAGE_SETUP:
+            continue
+        if words[i].split("/")[-1] in ("sh", "zsh", "bash"):  # a shell running a script: the script
+            k = i + 1
+            while k < len(words) and words[k].startswith("-") and words[k] != "-c":
+                k += 1
+            if k < len(words) and words[k] != "-c":
+                i = k
+        if words[i] == "uv" and i + 1 < len(words) and words[i + 1] == "run":  # uv run [options] PROGRAM
+            i += 2
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in UV_VALUE_FLAGS else 1
+            if i >= len(words):
+                return "uv"
+        return re.sub(r"^[\"']|[\"']$", "", words[i]).split("/")[-1]
+    return ""
+
+
 def script_path(word, args, cwd, here):
     """The script file a program word runs (itself, or the script a shell is given), if it can be found."""
     if os.path.basename(word) in ("sh", "zsh", "bash"):
@@ -324,11 +830,28 @@ def detect_tools(command, cwd, here=None, depth=0):
 
 # ---------- estimates ----------
 
+def run_time(job, end):
+    """Seconds a job really ran until end: from its start, without the time it was paused or waiting in the queue."""
+    if not job.get("started"):
+        return None
+    return round(sum(b - a for a, b in job_runs(dict(job, status="done", finished=end))), 1)
+
+
+def took(job):
+    """How long a finished job ran (its recorded `ran`; for older records start to end without its stops), or None
+    if the dispatcher closed its record: then nobody saw it end, and the page shows "-"."""
+    if job.get("ran") is not None:
+        return job["ran"]
+    if not job.get("started") or not job.get("finished") or job.get("exit") is None:
+        return None
+    return run_time(job, job["finished"])
+
+
 def expected_duration(job, history):
     if job.get("estimate"):
         return job["estimate"]
-    same = [h["finished"] - h["started"] for h in history
-            if h["project"] == job["project"] and h["name"] == job["name"]]
+    same = [took(h) for h in history if h["project"] == job["project"] and h["name"] == job["name"]]
+    same = [s for s in same if s is not None]
     if same:
         return int(statistics.median(same))
     return None
@@ -380,41 +903,66 @@ def snapshot():
         job["eta"] = t
     finished = sorted([j for j in jobs if j["status"] in TERMINAL], key=lambda j: j.get("finished") or 0,
                       reverse=True)[:25]
-    return {"now": now, "dispatcher": d, "running": current, "queued": queued, "light": light,
-            "light_queued": light_queued,
-            "finished": finished, "all_done": t if (current or queued) else now}
+    for job in finished:
+        job["took"] = took(job)
+    news = see_jobs(([current] if current else []) + queued + light + light_queued, finished, jobs, d, now)
+    return {"now": now, "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
+            "light": [public(j) for j in light], "light_queued": [public(j) for j in light_queued],
+            "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now}
 
 
-def queue_view(jobs):
-    """The queue as waiting clients need it: both queues' order and what runs now (published in dispatcher.json)."""
-    grant = granted()
-    heavy = queue_order([j for j in jobs if j["status"] == "queued" and j.get("kind") != "light"
-                         and not has_flag(j["id"], "cancel")])
-    light = queue_order([j for j in jobs if j.get("kind") == "light" and j["status"] == "queued"
-                         and not has_flag(j["id"], "cancel")])
-    running = next((j for j in jobs if j["id"] == grant and j["status"] not in TERMINAL), None)
-    light_now = [j for j in jobs if j.get("kind") == "light" and j["status"] in ("granted", "running")]
-    brief = lambda j: {"project": j["project"], "name": j["name"]}
-    return {"main": [j["id"] for j in heavy], "light": [j["id"] for j in light],
-            "running": brief(running) if running else None, "light_running": [brief(j) for j in light_now]}
+PRIVATE = ("submitter", "argv", "command", "cwd", "owner", "outputs", "artifacts")  # session ids, task output
+# paths, the command line and its folder (which usually name the outputs' absolute paths), the paths of its outputs
+# (and what an older rq guessed it produced): not for the page
 
 
-def queue_place(job_id, light, cache):
-    """(position, what runs now) for a waiting job, from the dispatcher's published queue; from an old dispatcher
-    that doesn't publish it, a full snapshot at most every 15 s."""
-    d = dispatcher_state()
-    q = d.get("queue")
-    if q is None:
-        if time.time() - cache.get("at", 0) >= 15:
-            snap = snapshot()
-            cache.update(at=time.time(), q={"main": [j["id"] for j in snap["queued"]],
-                                            "light": [j["id"] for j in snap["light_queued"]],
-                                            "running": snap["running"], "light_running": snap["light"]})
-        q = cache.get("q") or {}
-    line = q.get("light" if light else "main") or []
-    position = line.index(job_id) + 1 if job_id in line else None
-    now = (q.get("light_running") or [None])[0] if light else q.get("running")
-    return position, now, d
+def public(job):
+    """A job as the page and rq status --json get it: without who submitted it (session id, task output file),
+    without its command line and folder (only the program it runs: program) and without the paths of its outputs,
+    only how many it declared (output_count; no_output: it declared none)."""
+    if not job:
+        return job
+    view = {k: v for k, v in job.items() if k not in PRIVATE}
+    view["program"] = program_of(job.get("command"))
+    if job.get("outputs"):
+        view["output_count"] = len(job["outputs"])
+    return view
+
+
+def claude_seen(d, now):
+    """What the dispatcher last found of the Claude Code processes (claude_scan), if it is recent."""
+    claude = d.pop("claude", None)  # (session ids: not for the page)
+    if not d.get("alive") or not isinstance(claude, dict) or now - (claude.get("at") or 0) > 60:
+        return None
+    return claude
+
+
+def see_jobs(live, finished, jobs, d, now):
+    """Who sees what, for the page and rq status. A job not ended: watchers (live watchers of any session or a
+    terminal), unwatched (no task of the session that queued it watches it, so that session won't get its result),
+    owner_alive, and for an unwatched one session_ended (see session_gone). A finished one: unseen (no task of its
+    session got its result), with session_ended. Returns every unseen result of the last 24 h, newest first."""
+    claude = claude_seen(d, now)
+    news = sorted((j for j in jobs if j["status"] in TERMINAL and unseen(j, now)),
+                  key=lambda j: j.get("finished") or 0, reverse=True)
+    starts = proc_starts() if live or news else {}
+    watching = set()
+    for job in live:
+        found = live_watchers(job, starts)
+        sid = submitter_sid(job)
+        own = [w for w in found if not sid or watches_for(w, sid)]
+        job["watchers"], job["unwatched"], job["owner_alive"] = len(found), not own, owner_alive(job)
+        watching.update(w["session_id"] for w in found if w.get("session_id"))
+    for job in live:
+        job["session_ended"] = session_gone(job, claude, watching, starts) if job["unwatched"] else None
+    for job in news:
+        job["unseen"] = True
+        job["session_ended"] = session_gone(job, claude, watching, starts)
+    for job in finished:
+        job.setdefault("unseen", False)
+        job.setdefault("session_ended", None)
+    return [{k: job.get(k) for k in ("id", "project", "name", "kind", "status", "exit", "finished", "reason",
+                                     "session_ended")} for job in news]
 
 
 def queue_order(queued):
@@ -451,7 +999,8 @@ def cwd_of(pid):
 
 
 def rq_pids():
-    """The processes of rq itself: waiting or running clients and the dispatcher (their jobs are other processes)."""
+    """The processes of rq itself: watchers (rq run, rq wait), supervisors (rq _supervise), hooks (rq mine), the
+    dispatcher and any other rq command (their jobs are other processes)."""
     me = os.path.join(HOME, "rq")
     out = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True).stdout
     pids = set()
@@ -627,9 +1176,57 @@ def last_turn(path):
     return last
 
 
-def session_states():
-    """Per session: waiting for the user (turn ended, a question, maybe a permission prompt) or working.
-    Read from each session's chat transcript tail and its Claude process, never by asking the session."""
+CLAUDE_DESKTOP = re.compile(r"^/(?:(?! -).)*?/claude\.app/Contents/MacOS/claude(?: |$)")  # its path has spaces
+CLAUDE_CLI = re.compile(r"^(?:\S*/)?claude(?: |$)")
+SESSION_ID = re.compile(r"(?:^| )(?:--resume|--session-id|-r)[= ]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+
+def claude_session(command):
+    """(True, its session id or None) if a ps command line is a Claude Code session: the desktop app's
+    .../claude.app/Contents/MacOS/claude ... --resume=ID, or the CLI's claude --resume ID; else (False, None)."""
+    if not command or "disclaimer" in command.split()[0]:  # the desktop app's launcher, not the session itself
+        return False, None
+    if not (CLAUDE_DESKTOP.match(command) or CLAUDE_CLI.match(command)):
+        return False, None
+    m = SESSION_ID.search(command)
+    return True, m.group(1) if m else None
+
+
+def cwds_of(pids):
+    """{pid: working directory} of a few processes, with one lsof."""
+    if not pids:
+        return {}
+    out = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(str(p) for p in pids)],
+                         capture_output=True, text=True).stdout
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def job_what(job):
+    """A job's state in words, for notes, rq mine and the lines of a watcher that stops."""
+    if job["status"] not in TERMINAL and being_cancelled(job):
+        return "being cancelled (%s)" % (job.get("cancel_reason") or "rq cancel")
+    if job["status"] == "queued":
+        return "paused in the queue" if job.get("started") else "queued"
+    return {"granted": "starting"}.get(job["status"], job["status"])
+
+
+def being_cancelled(job):
+    """A job not ended yet that was cancelled: its owner (or the dispatcher) is stopping it."""
+    return has_flag(job["id"], "cancel") or bool(job.get("cancel_reason"))
+
+
+def session_states(found=None):
+    """Per session: waiting for the user (turn ended, a question, maybe a permission prompt), waiting for its jobs
+    (its turn ended while one of its tasks watches a job in rq) or working. Read from each session's chat
+    transcript tail and its Claude process, never by asking the session. Each comes with what it may not know:
+    its project's jobs that no task watches and results nobody has seen. found (a dict) gets the session ids that
+    Claude processes run and the projects of those that run without one (see session_gone)."""
     links = read_json(SESSIONS, {}) or {}
     out = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
     procs = []
@@ -641,16 +1238,44 @@ def session_states():
     for pid, ppid, command in procs:
         children.setdefault(ppid, []).append(command)
     resumed = {}  # transcript id -> the session's claude process
+    unnamed = []  # session processes without an id on their command line (a CLI session started fresh)
     for pid, ppid, command in procs:
-        m = re.search(r"/claude\.app/Contents/MacOS/claude .*--resume=([0-9a-f-]{36})", command)
-        if m and "disclaimer" not in command.split()[0]:  # the session itself, not its launcher
-            resumed[m.group(1)] = pid
+        is_session, session_id = claude_session(command)
+        if session_id:
+            resumed[session_id] = pid
+        elif is_session:
+            unnamed.append(pid)
+    fresh = {}  # project -> its session process that has no id
+    for pid, cwd in cwds_of(unnamed).items():
+        project = project_of(cwd)
+        if project:
+            fresh.setdefault(project, pid)
     now = time.time()
+    if found is not None:
+        found.update(ids=sorted(resumed), fresh=sorted(fresh), at=now)
     jobs = {}  # a project's jobs in rq: queued or running
-    for job in all_jobs():
+    watched = {}  # project -> the live watchers of its jobs
+    notes = {}  # project -> its jobs that no task watches, and results nobody has seen
+    starts = None
+    for job in sorted(all_jobs(), key=lambda j: j.get("submitted") or 0):
+        project = job.get("project")
         if job["status"] in ("queued", "granted", "running"):
-            counts = jobs.setdefault(job["project"], {"running": 0, "queued": 0})
+            counts = jobs.setdefault(project, {"running": 0, "queued": 0})
             counts["queued" if job["status"] == "queued" else "running"] += 1
+            if from_earlier_boot(job) or being_cancelled(job):
+                continue
+            starts = proc_starts() if starts is None else starts
+            live = live_watchers(job, starts)
+            if live:
+                watched.setdefault(project, []).extend(live)
+            sid = submitter_sid(job)
+            if not [w for w in live if not sid or watches_for(w, sid)]:  # no task of its session will tell it
+                notes.setdefault(project, []).append({"id": job["id"], "name": job["name"], "what": job_what(job),
+                                                      "unwatched": True, "elsewhere": bool(live)})
+        elif job["status"] in TERMINAL and unseen(job, now):
+            notes.setdefault(project, []).append({"id": job["id"], "name": job["name"], "what": job["status"],
+                                                  "exit": job.get("exit"), "finished": job.get("finished"),
+                                                  "unseen": True})
     states = []
     for project in sorted(links):
         folder = CHATS + dashed(project)
@@ -659,7 +1284,7 @@ def session_states():
         except OSError:
             continue
         live = [c for c in chats if os.path.basename(c)[:-6] in resumed]
-        if resumed and not live:
+        if resumed and not live and project not in fresh:
             continue  # sessions run as processes here, and this one has none: it was archived or closed
         chat = max(live or chats, key=os.path.getmtime, default=None)
         if not chat:
@@ -667,15 +1292,19 @@ def session_states():
         entry = last_turn(chat)
         if not entry:
             continue
-        claude = resumed.get(os.path.basename(chat)[:-6])
+        claude = resumed.get(os.path.basename(chat)[:-6]) or (None if live else fresh.get(project))
         shells = [c for c in children.get(claude, []) if "shell-snapshots" in c or c.startswith("/bin/zsh -c")]
         msg = entry.get("message") or {}
         content = msg.get("content") if isinstance(msg.get("content"), list) else []
         since = utc_ts(entry.get("timestamp") or "")
         tool = next((c for c in reversed(content) if isinstance(c, dict) and c.get("type") == "tool_use"), None)
         state = "working"
+        sid = os.path.basename(chat)[:-6]
         if entry["type"] == "assistant" and msg.get("stop_reason") == "end_turn":
-            state = "jobs" if project in jobs else "waiting"  # with jobs in rq, it waits for them, not for the user
+            # while a task of it watches a job in rq, it waits for that job, not for the user; a job nobody
+            # watches won't wake it, so then it waits for the user (the notes say which jobs)
+            waits = any(watches_for(w, sid) for w in watched.get(project, ()))
+            state = "jobs" if waits else "waiting"
         elif entry["type"] == "assistant" and tool:
             if tool.get("name") == "AskUserQuestion":
                 state = "question"
@@ -684,11 +1313,11 @@ def session_states():
         states.append({"project": project, "state": state, "since": since, "link": links.get(project),
                        "background": len(shells) if state == "waiting" else 0,
                        "tool": tool.get("name") if tool and state == "permission" else None,
-                       "jobs": jobs.get(project)})
+                       "jobs": jobs.get(project), "notes": notes.get(project, [])[-6:]})
     return states
 
 
-# ---------- artifacts: the pictures and videos a finished job produced ----------
+# ---------- outputs: the pictures and videos a job says it writes (rq run --output) ----------
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff", ".heic", ".exr"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
@@ -696,16 +1325,23 @@ MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
 NO_BROWSER_EXT = {".exr"}  # no browser shows these: the page offers to open them on the Mac instead
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".cache", ".mypy_cache", ".pytest_cache"}
 SCRATCH_GLOB = os.environ.get("RQ_SCRATCH_GLOB", "/private/tmp/claude-%d/" % os.getuid())  # this user's scratchpads
-ARTIFACT_GRACE = 5  # seconds after a job ends that its files may still land
-ARTIFACT_SETTLE = 8  # seconds to wait after a job ends before looking for its files
-ARTIFACT_DAYS = 2  # how far back the dispatcher looks for jobs without artifacts (older ones: when opened)
-MAX_SINGLES = 500  # single pictures and videos kept per job; sequences are always kept
+MAX_SINGLES = 500  # single pictures and videos a sheet shows of declared folders (declared files and sequences: all)
 SEQUENCE_MIN = 24  # numbered pictures in one folder that make a sequence (animation frames, not a few stills)
-_SEQ = re.compile(r"^(.*?)(\d+)(\.[A-Za-z0-9]+)$")
+FOLDER_DEPTH = 4  # how many folders deep a sheet looks into a declared folder
+FOLDER_ENTRIES = 20000  # how many files and folders it looks at in a declared folder, at most
+LISTING_TTL = 600  # seconds the page's links to files it found in a declared folder work without a new look
+FRAME_DIGITS = 18  # the longest frame number the page's links carry (time-stamped frames have 13 to 16 digits)
+_SEQ = re.compile(r"^(.*?)([0-9]+)(\.[A-Za-z0-9]+)$")  # (ASCII digits only: the names frame_file can rebuild)
+_FRAME_RUN = re.compile(r"#+|%0([1-9][0-9]?)d|%d")  # a frame number in a pattern: ####, %04d or %d
+_PRINTF_D = re.compile(r"%[-+0-9.]*d")  # anything printf or ffmpeg reads as a number (%4d, %00d, %-3d ...)
 for _type, _ext in (("video/quicktime", ".mov"), ("video/mp4", ".m4v"), ("video/webm", ".webm"),
                     ("video/x-matroska", ".mkv"), ("image/webp", ".webp"), ("image/avif", ".avif"),
                     ("image/heic", ".heic"), ("image/x-exr", ".exr")):
     mimetypes.add_type(_type, _ext)
+OUTPUT_HELP = ("say where the job writes its pictures and videos: --output PATH (a file, a folder, or a frame "
+               "pattern like renders/####.png; repeat it for several), or --no-output if it writes none")
+PROJECT_HELP = ("--project NAME is the project's folder name in the projects folder %s: one name, no /, not . or .."
+                % ROOT)
 
 
 def open_stop(job, now=None):
@@ -723,9 +1359,19 @@ def close_stop(job, now=None):
     return stops
 
 
+def plain_project(project):
+    """Whether a project name is one folder name under ROOT (never /, .., a/../.. or empty: those would take the
+    project's folders above ROOT)."""
+    return bool(project) and project not in (".", "..") and "/" not in project and "\0" not in project
+
+
 def project_dirs(project):
-    """A project's folder and this user's Claude Code scratchpad folders of it (also of sessions in its subfolders)."""
-    dirs = [os.path.realpath(os.path.join(ROOT, project))]
+    """A project's folder and this user's Claude Code scratchpad folders of it (also of sessions in its subfolders);
+    none for a name that isn't one folder under ROOT (an old record's --project /, .., a/../..)."""
+    base = os.path.normpath(os.path.join(ROOT, project or ""))
+    if not plain_project(project) or os.path.dirname(base) != ROOT:
+        return []
+    dirs = [os.path.realpath(base)]
     for d in glob.glob(SCRATCH_GLOB + ROOT_DASHED + "-" + dashed(project) + "*"):
         try:
             if os.path.isdir(d) and os.stat(d).st_uid == os.getuid() and project_of(d + "/") == project:
@@ -739,49 +1385,9 @@ def inside(path, tops):
     return any(path == t or path.startswith(t.rstrip("/") + "/") for t in tops)
 
 
-def media_files(project):
-    """{real path: (mtime, size)} of every picture and video file in a project's folders. Folders reached through a
-    symlink are not followed (snapshots link back into the project); a symlinked file counts only if it leads to a
-    regular picture or video file inside the project's own folders. The queue's own folder is skipped."""
-    tops = project_dirs(project)
-    found = {}
-    for top in tops:
-        stack = [top]
-        while stack:
-            folder = stack.pop()
-            if folder == HOME:
-                continue
-            try:
-                entries = list(os.scandir(folder))
-            except OSError:
-                continue
-            for e in entries:
-                if e.name in SKIP_DIRS:
-                    continue
-                try:
-                    if e.is_dir(follow_symlinks=False):
-                        stack.append(e.path)
-                        continue
-                    if os.path.splitext(e.name)[1].lower() not in MEDIA_EXT:
-                        continue
-                    if e.is_symlink():
-                        path = os.path.realpath(e.path)
-                        if os.path.splitext(path)[1].lower() not in MEDIA_EXT or not inside(path, tops):
-                            continue
-                        st = os.stat(path)
-                    else:
-                        path, st = e.path, e.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(st.st_mode) or path in found:
-                        continue
-                    found[path] = (st.st_mtime, st.st_size)
-                except OSError:
-                    continue
-    return found
-
-
 def job_end(job, now):
-    """When a job stopped producing files: its end, or for a lost job the last write to its log (the dispatcher
-    may notice a dead client long after it died)."""
+    """When a job ended: its end, or for a lost job the last write to its log (the dispatcher may notice a dead
+    client long after it died)."""
     if job["status"] not in TERMINAL:
         return now
     end = job.get("finished") or now
@@ -813,44 +1419,202 @@ def job_runs(job, now=None):
     return [r for r in runs if r[1] >= r[0]] or [(job["started"], job["started"])]
 
 
-def peer(job, base, now):
-    """A job prepared for attribution: its running intervals, the same with a little slack, its working folder."""
-    runs = job_runs(job, now)
-    if not runs:
-        return None
-    cwd = os.path.realpath(job.get("cwd") or "/").rstrip("/")
-    return dict(job, _runs=runs, _slack=[(runs[0][0] - 1, runs[-1][1] + ARTIFACT_GRACE)],
-                _span=(runs[0][0] - 1, runs[-1][1] + ARTIFACT_GRACE), _active=sum(b - a for a, b in runs),
-                _cwd=None if cwd in (base, ROOT, "") else cwd)
+def ext_of(path):
+    return os.path.splitext(path)[1].lower()
 
 
-def owner_of(path, mtime, candidates):
-    """Of the jobs that could have written a file: the ones really running at its mtime (else those within the
-    slack), then the one running in the file's folder (deepest working folder), then the shortest."""
-    live = [j for j in candidates if any(a <= mtime <= b for a, b in j["_runs"])]
-    pool = live or [j for j in candidates if any(a <= mtime <= b for a, b in j["_slack"])]
-    if not pool:
+def frame_pattern(name):
+    """A frame pattern's file name at its frame number: (prefix, width, suffix) for a run of # (as Blender writes
+    it) or %0Nd / %d (ffmpeg, printf); None if the name has no frame number, False if it has several."""
+    runs = list(_FRAME_RUN.finditer(name))
+    if len(runs) != 1:
+        return False if runs else None
+    m = runs[0]
+    width = len(m.group(0)) if m.group(0).startswith("#") else int(m.group(1) or 1)
+    return name[:m.start()], width, name[m.end():]
+
+
+def frame_file(prefix, width, suffix, frame):
+    """Frame n's file name: the number padded with zeros to the width (0: not padded)."""
+    return "%s%0*d%s" % (prefix, width, frame, suffix)
+
+
+def frame_number(digits, width):
+    """The frame a file name's number is in a pattern of this width, or None: padded with zeros to the width, and
+    longer numbers not padded (as Blender and printf write them), so each frame has one file name."""
+    if len(digits) == width or (len(digits) > width and digits[0] != "0"):
+        return int(digits)
+    return None
+
+
+class OutputError(ValueError):
+    """An --output that rq refuses, with what to change."""
+
+
+def declare_outputs(paths, no_output, cwd, project):
+    """The outputs for a job's record, from rq run's --output PATH (repeated) and --no-output: each a file, a
+    folder (a trailing / or an existing folder) or a frame pattern (####, %04d, %d), relative to cwd, inside the
+    project's folders, a file or pattern with a picture or video extension. Raises OutputError otherwise."""
+    if not paths and not no_output:
+        raise OutputError(OUTPUT_HELP)
+    if paths and no_output:
+        raise OutputError("--output and --no-output both: pass --output PATH for each file, folder or frame "
+                          "pattern the job writes, or only --no-output if it writes no pictures or videos")
+    tops = project_dirs(project)
+    outputs = []
+    for text in paths:
+        out = declare_output(text, cwd, project, tops)
+        if not any(o["kind"] == out["kind"] and o["path"] == out["path"] for o in outputs):
+            outputs.append(out)
+    return outputs
+
+
+def below(path, bases):
+    """path's part below the longest of bases that holds it ("" for a base itself), or None."""
+    for b in sorted((b.rstrip("/") for b in bases), key=len, reverse=True):
+        if path == b:
+            return ""
+        if path.startswith(b + "/"):
+            return path[len(b) + 1:]
+    return None
+
+
+def has_frame_number(part):
+    return bool(_FRAME_RUN.search(part) or _PRINTF_D.search(part))
+
+
+def bad_frame_number(name):
+    """Why rq can't take a file name's frame number, or None: a printf number other than %0Nd and %d (ffmpeg pads
+    %4d with zeros, printf with spaces, so rq doesn't guess), or a run of # with digits right after it (take#1.mp4,
+    where the # is part of the name)."""
+    for m in _PRINTF_D.finditer(name):
+        if not re.match(r"^(?:%0[1-9][0-9]?d|%d)$", m.group(0)):
+            digits = re.findall(r"[0-9]+", m.group(0))
+            width = int(digits[-1]) if digits else 0
+            width = 4 if width >= 100 else width
+            if width <= 1:  # (not padded)
+                return ("%s isn't a frame number rq reads: write %%d for numbers not padded (1, 2, 3), or %%04d "
+                        "(or ####) for numbers padded with zeros to 4 digits" % m.group(0))
+            return ("%s isn't a frame number rq reads: write %%0%dd%s for numbers padded with zeros to %d digits, "
+                    "or %%d for numbers not padded (1, 2, 3)" % (
+                        m.group(0), width, " (or %s)" % ("#" * width) if width <= 8 else "", width))
+    if re.search(r"#+(?=[0-9])", name):
+        return ("rq reads a run of # in a file name as its frame number, and here digits follow it; for a file with "
+                "a # in its name, declare the folder it is in, ending in /")
+    return None
+
+
+def declare_output(text, cwd, project, tops):
+    if not text.strip():
+        raise OutputError("--output needs a path: a file, a folder or a frame pattern like renders/####.png")
+    if text.startswith("//"):
+        raise OutputError("--output %s: // is Blender's \"next to the .blend file\", but rq takes a PATH from the "
+                          "folder you submit from (or an absolute one): with the .blend file in this folder, "
+                          "--output %s" % (text, text[2:]))
+    if not tops:  # (rq run checks the name first; this keeps the project's folders from going above ROOT)
+        raise OutputError(PROJECT_HELP)
+    raw = os.path.expanduser(text)
+    path = os.path.normpath(os.path.join(cwd, raw))
+    real = os.path.realpath(path)
+    folder = raw.endswith("/") or os.path.isdir(path)
+    base = os.path.normpath(os.path.join(ROOT, project))
+    if not inside(real, tops):
+        if inside(path, tops + [base]):  # in the project as written, but a symlink on the way leads out of it
+            raise OutputError(
+                "--output %s is outside the project: it leads through a symlink to %s, and rq shows only files that "
+                "really are in %s's folder or its Claude Code scratchpads, so have the job write into a real folder "
+                "there (not one that links elsewhere)" % (text, real, project))
+        where = "%s's folder %s or one of its Claude Code scratchpads" % (project, tops[0])
+        if not os.path.isdir(tops[0]):
+            where += " (there is no such project folder: from a folder outside the projects, pass --project NAME)"
+        raise OutputError("--output %s is outside the project: rq shows only what a job writes in %s" % (text, where))
+    if folder and real in tops:
+        raise OutputError(
+            "--output %s is the whole %s, where other jobs write too: declare this job's own files, frame pattern "
+            "or a folder only it writes into (for example --output renders/final/)" % (
+                text, "project folder" if real == tops[0] else "folder of the project's Claude Code scratchpads"))
+    # the folders the session named (a relative PATH's own parts; an absolute one's below the project's folder),
+    # never those of the folder it submits from
+    named = (below(path, tops + [base]) or below(real, tops) or "") if os.path.isabs(raw) else raw
+    parts = [p for p in named.split("/") if p not in ("", ".", "..")]
+    if any(has_frame_number(p) for p in (parts if folder else parts[:-1])):
+        given = raw.rstrip("/").split("/")
+        given = given if folder else given[:-1]
+        i = next((i for i, p in enumerate(given) if has_frame_number(p)), 0)
+        up = "/".join(given[:i]) + "/" if i else ""
+        raise OutputError("--output %s: rq reads a frame number (a run of #, %%04d or %%d) only in a file name, not "
+                          "in a folder's name; declare the folder above the numbered folders instead, ending in /%s"
+                          % (text, " (--output %s)" % up if up and up != "/" else ""))
+    if folder:
+        return {"kind": "folder", "path": path, "declared": text}
+    name = os.path.basename(path)
+    spec = frame_pattern(name)
+    if spec is False:
+        raise OutputError("--output %s: a frame pattern has one frame number in its file name (a run of #, "
+                          "or %%04d or %%d)" % text)
+    if ext_of(name) not in MEDIA_EXT:
+        up = os.path.dirname(text)
+        raise OutputError(
+            "--output %s isn't a picture or video file the status page shows (%s). For frames or files in another "
+            "format, declare the folder the job writes them into, ending in / (%s), so its sheet offers Show in "
+            "Finder; --no-output is only for a job that writes no pictures or videos at all" % (
+                text, ", ".join(sorted(e[1:] for e in MEDIA_EXT)),
+                "--output %s/" % up if up and up != "/" else "a folder only this job writes into, e.g. --output renders/"))
+    problem = bad_frame_number(name)
+    if problem:
+        raise OutputError("--output %s: %s" % (text, problem))
+    return {"kind": "pattern" if spec else "file", "path": path, "declared": text}
+
+
+def output_key(out):
+    """The key of a declared output in the page's links: the same for the same declared path."""
+    return item_key(out.get("kind"), out.get("path"))
+
+
+def item_key(*parts):
+    """A short stable id for an output or a file found in one (its URL keeps working when the sheet is rebuilt)."""
+    return hashlib.sha1("\0".join(str(p) for p in parts).encode()).hexdigest()[:12]
+
+
+def media_target(path, tops, within=None):
+    """path resolved, if it is a regular picture or video file inside the project's folders (and inside the
+    declared folder within, for a file found in one), else None. Checked on disk each time it is asked for, so
+    never a file a symlink swapped in since."""
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError:
         return None
-    shortest = lambda j: (j["_active"], j["id"])
-    in_folder = [j for j in pool if j["_cwd"] and (path + "/").startswith(j["_cwd"] + "/")]
-    if in_folder:
-        depth = max(len(j["_cwd"]) for j in in_folder)
-        return min((j for j in in_folder if len(j["_cwd"]) == depth), key=shortest)
-    return min(pool, key=shortest)
+    if not stat.S_ISREG(st.st_mode) or ext_of(real) not in MEDIA_EXT or not inside(real, tops):
+        return None
+    if within is not None and not inside(real, [os.path.realpath(within)]):
+        return None
+    return real
+
+
+def is_package(path):
+    """A folder that `open` would launch or hand to an app instead of showing it (Tool.app, a .photoslibrary, a
+    .rtfd): a name with an extension, or a bundle's Contents folder. The page shows those in the Finder instead."""
+    return os.path.isdir(path) and (ext_of(path) != "" or os.path.isdir(os.path.join(path, "Contents")))
+
+
+def folder_target(path, tops, within=None):
+    """path resolved, if it is a folder inside the project's folders (and inside within), else None."""
+    real = os.path.realpath(path)
+    if not os.path.isdir(real) or not inside(real, tops):
+        return None
+    if within is not None and not inside(real, [os.path.realpath(within)]):
+        return None
+    return real
 
 
 def sequence_key(path):
     """(folder, prefix, extension, number, digits) of a numbered picture, else None."""
-    ext = os.path.splitext(path)[1].lower()
+    ext = ext_of(path)
     m = _SEQ.match(os.path.basename(path))
-    if not m or ext not in IMAGE_EXT:
+    if not m or ext not in IMAGE_EXT or len(m.group(2)) > FRAME_DIGITS:
         return None
     return os.path.dirname(path), m.group(1), m.group(3), int(m.group(2)), m.group(2)
-
-
-def item_key(*parts):
-    """A short stable id for an artifact (its URL keeps working when the list is rebuilt)."""
-    return hashlib.sha1("\0".join(str(p) for p in parts).encode()).hexdigest()[:12]
 
 
 def frame_width(frames):
@@ -862,9 +1626,68 @@ def frame_width(frames):
     return None
 
 
-def group_media(files):
-    """Pictures and videos as items. Numbered pictures in one folder (padded or not) become a sequence, with its
-    frames as ranges; numbered videos stay single videos."""
+def frame_ranges(numbers):
+    """Frame numbers as [first, last] ranges."""
+    ranges = []
+    for n in sorted(numbers):
+        if ranges and n == ranges[-1][1] + 1:
+            ranges[-1][1] = n
+        else:
+            ranges.append([n, n])
+    return ranges
+
+
+def single(path, real, size, mtime, key):
+    return {"kind": "video" if ext_of(real) in VIDEO_EXT else "image", "key": key, "path": path, "real": real,
+            "size": size, "mtime": mtime}
+
+
+def folder_media(folder, tops):
+    """{real path: (mtime, size)} of the pictures and videos in a declared folder (resolved), up to FOLDER_DEPTH
+    folders deep and FOLDER_ENTRIES entries, and whether it holds more than that. Folders reached through a symlink
+    are not followed; a symlinked file counts only if it leads to a regular picture or video file inside the folder."""
+    found, seen, partial = {}, 0, False
+    stack = [(folder, 0)]
+    while stack:
+        here, depth = stack.pop()
+        try:
+            entries = list(os.scandir(here))
+        except OSError:
+            continue
+        for e in entries:
+            seen += 1
+            if seen > FOLDER_ENTRIES:
+                return found, True
+            if e.name in SKIP_DIRS:
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth < FOLDER_DEPTH:
+                        stack.append((e.path, depth + 1))
+                    else:
+                        partial = True
+                    continue
+                if ext_of(e.name) not in MEDIA_EXT:
+                    continue
+                if e.is_symlink():
+                    path = media_target(e.path, tops, folder)
+                    if not path:
+                        continue
+                    st = os.stat(path)
+                else:
+                    path, st = e.path, e.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                found.setdefault(path, (st.st_mtime, st.st_size))
+            except OSError:
+                continue
+    return found, partial
+
+
+def group_media(files, key):
+    """Pictures and videos as items, each with the key key(path) or key(folder, prefix, extension) gives it.
+    Numbered pictures in one folder (padded or not) become a sequence, with its frames as ranges; numbered videos
+    stay single videos."""
     groups, singles = {}, []
     for path, (mtime, size) in files.items():
         k = sequence_key(path)
@@ -878,210 +1701,255 @@ def group_media(files):
         if len(frames) < SEQUENCE_MIN or width is None:
             singles += [(p, mt, sz) for _, _, p, mt, sz in frames]  # a few stills, or mixed numbering
             continue
-        numbers = sorted({n for n, _, _, _, _ in frames})
-        ranges = []
-        for n in numbers:
-            if ranges and n == ranges[-1][1] + 1:
-                ranges[-1][1] = n
-            else:
-                ranges.append([n, n])
-        items.append({"kind": "sequence", "key": item_key(folder, prefix, ext), "media": "image", "dir": folder,
-                      "prefix": prefix, "width": width, "ext": ext, "frames": ranges, "count": len(numbers),
-                      "size": sum(sz for _, _, _, _, sz in frames), "mtime": max(mt for _, _, _, mt, _ in frames)})
-    singles.sort(key=lambda f: -f[1])
+        numbers = {n for n, _, _, _, _ in frames}
+        items.append({"kind": "sequence", "key": key(folder, prefix, ext), "dir": folder, "prefix": prefix,
+                      "width": width, "suffix": ext, "name": "%s%s%s" % (prefix, "#" * max(width, 1), ext),
+                      "frames": frame_ranges(numbers), "count": len(numbers),
+                      "size": sum(sz for _, _, _, _, sz in frames), "mtime": max(mt for _, _, _, mt, _ in frames),
+                      "files": [p for _, _, p, _, _ in frames]})
     for path, mtime, size in singles:
-        ext = os.path.splitext(path)[1].lower()
-        items.append({"kind": "video" if ext in VIDEO_EXT else "image", "key": item_key(path), "path": path,
-                      "size": size, "mtime": mtime})
-    order = {"video": 0, "image": 1, "sequence": 2}
-    items.sort(key=lambda i: (order[i["kind"]], -i["mtime"]))
-    kept, truncated, n_singles = [], 0, 0
-    for item in items:
-        if item["kind"] != "sequence":
-            n_singles += 1
-            if n_singles > MAX_SINGLES:
-                truncated += 1
-                continue
-        kept.append(item)
-    return kept, truncated
+        items.append(single(path, path, size, mtime, key(path)))
+    return items
 
 
-def save_artifacts(job, items, truncated, now):
-    write_json(os.path.join(ARTIFACTS, job["id"] + ".json"), {"at": now, "items": items, "truncated": truncated})
-    kinds = {}
-    for item in items:
-        kinds[item["kind"]] = kinds.get(item["kind"], 0) + 1
-    fresh = load_job(job["id"]) or job  # keep anything its client wrote meanwhile
-    fresh["artifacts"] = {"at": now, "count": len(items) + truncated, "kinds": kinds}
-    save_job(fresh)
-    job.update(fresh)
+def list_file(out, tops):
+    real = media_target(out["path"], tops)
+    if not real:
+        return {"state": "refused" if os.path.exists(out["path"]) else "missing"}, []
+    try:
+        st = os.stat(real)
+    except OSError:
+        return {"state": "missing"}, []
+    item = single(out["path"], real, st.st_size, st.st_mtime, output_key(out))
+    return {"state": "here", "videos" if item["kind"] == "video" else "pictures": 1}, [item]
 
 
-def index_artifacts(targets, jobs):
-    """Find and save the artifacts of finished jobs, with one scan per project. Every file goes to the job that
-    wrote it (owner_of); a frame sequence goes as a whole to the job that wrote most of its frames."""
-    now = time.time()
-    by_project = {}
-    for job in targets:
-        if job["project"] == SELF or not job.get("started"):
-            save_artifacts(job, [], 0, now)  # nothing to look for
-        else:
-            by_project.setdefault(job["project"], []).append(job)
-    for project, mine in by_project.items():
-        base = os.path.realpath(os.path.join(ROOT, project))
-        files = sorted((mtime, path, size) for path, (mtime, size) in media_files(project).items())
-        times = [f[0] for f in files]
-        peers = sorted((p for p in (peer(j, base, now) for j in jobs if j["project"] == project) if p),
-                       key=lambda p: p["_span"][0])
-        starts = [p["_span"][0] for p in peers]
-        targets_p = [p for p in (peer(j, base, now) for j in mine) if p]
-
-        def candidates(mtime):
-            return [p for p in peers[:bisect.bisect_right(starts, mtime)] if p["_span"][1] >= mtime]
-
-        # the files the targets could own, and every frame of any sequence they touch
-        wanted, touched = {}, set()
-        for t in targets_p:
-            lo, hi = t["_span"]
-            for mtime, path, size in files[bisect.bisect_left(times, lo):bisect.bisect_right(times, hi)]:
-                wanted[path] = (mtime, size)
-                k = sequence_key(path)
-                if k:
-                    touched.add(k[:3])
-        if touched:
-            for mtime, path, size in files:
-                k = sequence_key(path)
-                if k and k[:3] in touched:
-                    wanted[path] = (mtime, size)
-        owner = {path: owner_of(path, mt, candidates(mt)) for path, (mt, sz) in wanted.items()}
-        votes = {}
-        for path, o in owner.items():
-            k = sequence_key(path)
-            if k and o:
-                votes.setdefault(k[:3], {}).setdefault(o["id"], 0)
-                votes[k[:3]][o["id"]] += 1
-        for path in owner:
-            k = sequence_key(path)
-            if k and k[:3] in votes and sum(votes[k[:3]].values()) >= SEQUENCE_MIN:
-                winner = max(votes[k[:3]].items(), key=lambda kv: (kv[1], kv[0]))[0]
-                owner[path] = {"id": winner}
-        for job in mine:
-            owned = {p: wanted[p] for p, o in owner.items() if o and o["id"] == job["id"]}
-            items, truncated = group_media(owned)
-            save_artifacts(job, items, truncated, now)
-
-
-def needs_artifacts(job, now):
-    if job["status"] not in TERMINAL or not job.get("finished") or now - job["finished"] < ARTIFACT_SETTLE:
-        return False
-    if now - job["finished"] > ARTIFACT_DAYS * 86400:
-        return False
-    a = job.get("artifacts")
-    return not a or a.get("at", 0) < job["finished"] + ARTIFACT_SETTLE - 1
-
-
-def artifact_indexer():
-    """Dispatcher thread: soon after a job ends, find what it produced (scans take seconds, so not in the loop)."""
-    while True:
+def list_pattern(out, tops):
+    """The files matching a frame pattern: pictures as one sequence, videos each on its own."""
+    folder, name = os.path.split(out["path"])
+    prefix, width, suffix = frame_pattern(name)
+    found = {}
+    real_folder = folder_target(folder, tops)
+    if real_folder:
+        match = re.compile(re.escape(prefix) + r"([0-9]{1,%d})" % FRAME_DIGITS + re.escape(suffix) + r"\Z").match
         try:
-            now = time.time()
-            jobs = all_jobs()
-            targets = sorted((j for j in jobs if needs_artifacts(j, now)), key=lambda j: -j["finished"])[:2000]
-            if targets:
-                index_artifacts(targets, jobs)
-        except Exception as e:
-            print("rq: artifact indexer: %r" % e, flush=True)
-        time.sleep(10)
+            entries = list(os.scandir(real_folder))
+        except OSError:
+            entries = []
+        for e in entries:
+            m = match(e.name)
+            n = frame_number(m.group(1), width) if m else None
+            if n is None:
+                continue
+            try:
+                if e.is_symlink():
+                    real = media_target(e.path, tops)
+                    if not real:
+                        continue
+                    st = os.stat(real)
+                else:
+                    real, st = e.path, e.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+            except OSError:
+                continue
+            found[n] = (os.path.join(folder, e.name), real, st.st_mtime, st.st_size)
+    if not found:
+        return {"state": "missing" if not real_folder else "empty"}, []
+    numbers = sorted(found)
+    view = {"state": "here", "frames": len(numbers), "first": numbers[0], "last": numbers[-1]}
+    if ext_of(name) in VIDEO_EXT:
+        view["videos"] = len(numbers)
+        return view, [single(p, real, sz, mt, item_key(out["kind"], out["path"], n))
+                      for n, (p, real, mt, sz) in sorted(found.items())]
+    return view, [{"kind": "sequence", "key": output_key(out), "dir": folder, "prefix": prefix, "width": width,
+                   "suffix": suffix, "name": name, "frames": frame_ranges(numbers), "count": len(numbers),
+                   "size": sum(f[3] for f in found.values()), "mtime": max(f[2] for f in found.values()),
+                   "files": [f[1] for f in found.values()]}]
 
 
-def frame_path(item, frame):
-    if not any(a <= frame <= b for a, b in item["frames"]):
-        return None
-    return os.path.join(item["dir"], "%s%0*d%s" % (item["prefix"], item["width"], frame, item["ext"]))
+def list_folder(out, tops):
+    real_folder = folder_target(out["path"], tops)
+    if not real_folder:
+        return {"state": "refused" if os.path.exists(out["path"]) else "missing"}, []
+    files, partial = folder_media(real_folder, tops)
+    # keys from the declared folder and the place in it: the same for the same file, whatever else is there
+    items = group_media(files, lambda path, *seq: item_key(out["kind"], out["path"], os.path.relpath(
+        path, real_folder), *seq))
+    for item in items:
+        item["within"] = out["path"]  # (a file of a declared folder is handed out only from inside it)
+    view = {"state": "here" if items else "empty", "partial": partial}
+    for kind, word in (("video", "videos"), ("image", "pictures"), ("sequence", "sequences")):
+        n = sum(1 for i in items if i["kind"] == kind)
+        if n:
+            view[word] = n
+    return view, items
 
 
 def display_path(path, project):
-    """A path as the page shows it: relative to the project folder, or scratch/... inside a scratchpad."""
+    """A path as the page shows it: relative to the project folder (. for the folder itself), or scratch/...
+    inside a scratchpad, else only its name. Its last part as it is named, never where a symlink there leads."""
     base = os.path.realpath(os.path.join(ROOT, project))
-    if (path + "/").startswith(base + "/"):
-        return os.path.relpath(path, base)
-    m = re.search(r"/scratchpad/(.*)$", path)
+    path = os.path.normpath(path)
+    for p in (path, os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))):
+        if p == base:
+            return "."
+        if p.startswith(base + "/"):
+            return os.path.relpath(p, base)
+    m = re.search(r"/scratchpad(/.*)?$", path)
     if m:
-        return "scratch/" + m.group(1)
+        return "scratch" + (m.group(1) or "")
     return os.path.basename(path)
 
 
-def load_artifacts(job_id):
-    return read_json(os.path.join(ARTIFACTS, job_id + ".json"), {}) or {}
+def list_outputs(job):
+    """What is at a job's declared outputs now: each output's state and counts for the page (in the order they were
+    declared), and the files and sequences found there, each file once: every declared file and pattern's files,
+    and at most MAX_SINGLES single files of declared folders. Where outputs overlap, a declared file or pattern
+    shows it rather than a declared folder around it."""
+    tops = project_dirs(job["project"]) if job.get("project") else []
+    views, items, covered, partial = {}, [], set(), False
+    listers = {"file": list_file, "pattern": list_pattern, "folder": list_folder}
+    declared = [(i, out) for i, out in enumerate(job.get("outputs") or []) if out.get("kind") in listers
+                and out.get("path") and (out["kind"] != "pattern" or frame_pattern(os.path.basename(out["path"])))]
+    for i, out in sorted(declared, key=lambda io: list(listers).index(io[1]["kind"])):
+        view, found = listers[out["kind"]](out, tops)
+        partial = partial or view.pop("partial", False)
+        if out["kind"] == "pattern":
+            shown = display_path(os.path.dirname(out["path"]), job["project"]) + "/" + os.path.basename(out["path"])
+            shown = shown[2:] if shown.startswith("./") else shown
+        else:
+            shown = display_path(out["path"], job["project"])
+            shown = shown.rstrip("/") + "/" if out["kind"] == "folder" else shown
+        views[i] = dict(view, key=output_key(out), kind=out["kind"], path=shown)
+        for item in found:
+            files = set(item.pop("files", None) or [item["real"]])
+            if files <= covered:
+                continue
+            covered |= files
+            items.append(dict(item, order=i, src=views[i]["key"]))  # (src: the output it was found at)
+    # declared files and patterns always show, ahead of what declared folders hold; the cap is for folders
+    rank = {"video": 0, "image": 1, "sequence": 2}
+    items.sort(key=lambda it: ("within" in it, rank[it["kind"]], it["order"], -it["mtime"]))
+    kept, truncated, singles = [], 0, 0
+    for item in items:
+        if item["kind"] != "sequence" and "within" in item:
+            singles += 1
+            if singles > MAX_SINGLES:
+                truncated += 1
+                continue
+        kept.append(item)
+    return {"outputs": [views[i] for i in sorted(views)], "items": kept, "truncated": truncated, "partial": partial}
 
 
-def job_artifacts(job):
-    """A job's artifacts for the page (found now if the dispatcher hasn't yet), without absolute paths."""
-    a = load_artifacts(job["id"])
-    if job["status"] in TERMINAL and not a:
-        index_artifacts([job], all_jobs())
-        a = load_artifacts(job["id"])
-    runs = job_runs(job)
-    until = (runs[-1][1] + ARTIFACT_GRACE) if runs else 0
+_listings = {}  # job id -> (when, {key: item}): the files a sheet found in declared folders, for its links
+_listings_lock = threading.Lock()
+
+
+def remember_listing(job):
+    """Look at a job's outputs now and remember what is there, so the page's links to it work (for LISTING_TTL)."""
+    listing = list_outputs(job)
+    with _listings_lock:
+        _listings[job["id"]] = (time.time(), {item["key"]: item for item in listing["items"]})
+        for old in sorted(_listings, key=lambda k: _listings[k][0])[:-32]:
+            del _listings[old]
+    return listing
+
+
+def listed_item(job, key):
+    """The file or sequence a key names among what the page last saw at a job's outputs (looked at again if the
+    key is new or that was a while ago)."""
+    with _listings_lock:
+        hit = _listings.get(job["id"])
+    if hit and time.time() - hit[0] < LISTING_TTL and key in hit[1]:
+        return hit[1][key]
+    remember_listing(job)
+    with _listings_lock:
+        return (_listings.get(job["id"]) or (0, {}))[1].get(key)
+
+
+def job_sheet(job):
+    """A job's sheet for the page: what is at its declared outputs now, without absolute paths."""
+    listing = remember_listing(job) if job.get("outputs") else {"outputs": [], "items": [], "truncated": 0,
+                                                                  "partial": False}
     out = []
-    for item in a.get("items", []):
-        ext = (item.get("ext") or os.path.splitext(item.get("path", ""))[1]).lower()
-        view = dict(key=item.get("key") or "", kind=item["kind"], size=item["size"], mtime=item["mtime"], ext=ext,
+    for item in listing["items"]:
+        ext = ext_of(item["name"] if item["kind"] == "sequence" else item["real"])
+        view = dict(key=item["key"], kind=item["kind"], size=item["size"], mtime=item["mtime"], ext=ext,
                     browser=ext not in NO_BROWSER_EXT)
         if item["kind"] == "sequence":
-            view.update(media=item["media"], frames=item["frames"], count=item["count"], width=item["width"],
-                        name="%s%s%s" % (item["prefix"], "#" * max(item["width"], 1), item["ext"]),
-                        dir=display_path(item["dir"], job["project"]), exists=os.path.isdir(item["dir"]))
+            view.update(name=item["name"], dir=display_path(item["dir"], job["project"]), frames=item["frames"],
+                        count=item["count"], width=item["width"], prefix=item["prefix"], suffix=item["suffix"])
         else:
-            try:
-                now_mtime = os.stat(item["path"]).st_mtime
-                exists = True
-            except OSError:
-                now_mtime, exists = None, False
             view.update(name=os.path.basename(item["path"]),
-                        dir=os.path.dirname(display_path(item["path"], job["project"])), exists=exists,
-                        changed=bool(exists and until and now_mtime > until))
+                        dir=display_path(os.path.dirname(item["path"]), job["project"]))
         out.append(view)
     return {"id": job["id"], "project": job["project"], "name": job["name"], "status": job["status"],
-            "kind": job.get("kind"), "tools": job.get("tools"), "command": job.get("command"),
+            "kind": job.get("kind"), "tools": job.get("tools"), "program": program_of(job.get("command")),
             "started": job.get("started"), "finished": job.get("finished"), "exit": job.get("exit"),
-            "artifacts": out, "truncated": a.get("truncated", 0), "indexed": bool(a),
+            "took": took(job), "reason": job.get("reason"), "no_output": bool(job.get("no_output")),
+            "declared": bool(job.get("outputs")), "outputs": listing["outputs"], "artifacts": out,
+            "truncated": listing["truncated"], "partial": listing["partial"],
             "pending": job["status"] not in TERMINAL}
 
 
 def artifact_target(job_id, key, frame=None):
-    """The file (or the folder, for a whole sequence) an artifact key names, re-checked on disk: a regular picture
-    or video file inside the project's own folders, never anything a symlink swapped in since."""
+    """The file (or the folder, for a whole sequence or a declared folder) a key names, re-checked on disk: only
+    what the job declared, and only a regular picture or video file inside the project's folders (a file of a
+    declared folder: inside that folder), never anything a symlink swapped in since."""
     if not re.match(r"^[A-Za-z0-9_.-]+$", job_id or "") or not re.match(r"^[0-9a-f]{12}$", key or ""):
         return None
     job = load_job(job_id)
-    item = next((i for i in load_artifacts(job_id).get("items") or [] if i.get("key") == key), None)
-    if not job or not item:
+    if not job or not job.get("outputs") or not job.get("project"):
         return None
     tops = project_dirs(job["project"])
-    if item["kind"] == "sequence" and frame is None:
-        path = os.path.realpath(item["dir"])
-        return path if os.path.isdir(path) and inside(path, tops) else None
-    path = frame_path(item, frame) if item["kind"] == "sequence" else item["path"] if frame is None else None
-    if not path:
+    for out in job["outputs"]:
+        if not out.get("path") or output_key(out) != key:
+            continue
+        if out.get("kind") == "file":
+            return media_target(out["path"], tops) if frame is None else None
+        if out.get("kind") == "folder":
+            return folder_target(out["path"], tops) if frame is None else None
+        if out.get("kind") == "pattern":
+            folder, name = os.path.split(out["path"])
+            spec = frame_pattern(name)
+            if not spec:
+                return None
+            if frame is None:
+                return folder_target(folder, tops)
+            return media_target(os.path.join(folder, frame_file(spec[0], spec[1], spec[2], frame)), tops)
         return None
-    path = os.path.realpath(path)
-    try:
-        ok = stat.S_ISREG(os.stat(path).st_mode)
-    except OSError:
-        return None
-    return path if ok and os.path.splitext(path)[1].lower() in MEDIA_EXT and inside(path, tops) else None
+    item = listed_item(job, key)
+    if not item or item.get("src") not in {output_key(o) for o in job["outputs"]}:
+        return None  # (also a file the dispatcher saw at an output the job no longer declares)
+    within = item.get("within")
+    if item["kind"] == "sequence":
+        if frame is None:
+            return folder_target(item["dir"], tops, within)
+        return media_target(os.path.join(item["dir"], frame_file(item["prefix"], item["width"], item["suffix"],
+                                                                 frame)), tops, within)
+    return media_target(item["path"], tops, within) if frame is None else None
 
 
 # ---------- dispatcher ----------
 
+def remove_turn(path, job_id):
+    """Take back a turn, if it is still that job's (never one given to another job meanwhile)."""
+    if granted(path) == job_id:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
 def repair_grants(jobs):
     """A job marked granted that holds no turn (the dispatcher stopped between the two writes) goes back in line."""
     turns = {granted(GRANT), granted(GRANT_LIGHT)}
-    for job in jobs.values():
+    for job in list(jobs.values()):
         if job["status"] == "granted" and job["id"] not in turns:
-            job["status"] = "queued"
-            save_job(job)
+            new = update_job(job["id"], only_if=lambda j: j["status"] == "granted"
+                             and j["id"] not in {granted(GRANT), granted(GRANT_LIGHT)}, status="queued")
+            jobs[job["id"]] = new or load_job(job["id"]) or job
 
 
 def dispatch_light(jobs):
@@ -1091,70 +1959,233 @@ def dispatch_light(jobs):
     if turn:
         job = load_job(turn)
         if not job or job["status"] in TERMINAL or job.get("kind") != "light":
-            os.remove(GRANT_LIGHT)
+            remove_turn(GRANT_LIGHT, turn)
             turn = None
     if turn:
         return
-    current = [j for j in all_jobs() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
+    current = [j for j in jobs.values() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
     if current:
         return
-    waiting = queue_order([j for j in all_jobs() if j.get("kind") == "light" and j["status"] == "queued"])
+    waiting = queue_order([j for j in jobs.values() if j.get("kind") == "light" and j["status"] == "queued"
+                           and waits(j)])
     if waiting:
         job = waiting[0]
-        give_turn(GRANT_LIGHT, job["id"])
-        job.update(status="granted", granted=time.time())
-        save_job(job)
+        # the record first: its client may start as soon as the turn file names it
+        new = update_job(job["id"], only_if=lambda j: j["status"] == "queued" and j.get("kind") == "light"
+                         and not has_flag(j["id"], "cancel"), status="granted", granted=time.time())
+        if new:
+            jobs[job["id"]] = new
+            give_turn(GRANT_LIGHT, job["id"])
+
+
+def stop_frozen(job, pgid):
+    """SIGCONT and SIGTERM to a paused job's processes (a light job paused in the queue whose owner is gone or
+    that was cancelled), so they don't stay frozen. Returns a note if that wasn't possible."""
+    try:
+        signal_group(pgid, signal.SIGCONT, signal.SIGTERM)
+    except OSError as e:
+        print("rq: %s: could not stop its processes: %r" % (job["id"], e), flush=True)
+        return "its processes (group %s) could not be stopped: %s" % (pgid, e.strerror or e)
+    return None
+
+
+_cancels_sent = {}  # job id -> when the dispatcher sent SIGTERM to the processes of a job nobody owns
+_stop_notes = {}  # job id -> why the dispatcher could not stop its processes
+
+
+def waits(job):
+    """A queued job that waits for a turn: not one being cancelled, and not one whose processes the dispatcher is
+    stopping (its owner is gone)."""
+    return not has_flag(job["id"], "cancel") and job["id"] not in _cancels_sent
+
+
+def sweep(jobs):
+    """Close the records nobody else will close, on every tick (also while a job holds the turn): jobs from before
+    the Mac restarted, queued jobs whose owner is gone (or, for older records, that were cancelled), and jobs whose
+    owner and processes are all gone. The owner is the job's rq supervisor (v2) or its rq client (older records). A
+    v2 job whose supervisor lives is left to it, cancels included. Each write re-reads the record and re-checks
+    under the jobs lock, so a result its owner wrote meanwhile stays. A live owner records its own end, so its flags
+    stay for it. Processes of a job nobody owns get SIGCONT and SIGTERM (SIGKILL after CANCEL_KILL) when it was
+    cancelled or paused in the queue, and its record is closed only once they have ended; a process group whose id
+    was given to other processes since (see job_group) counts as ended and is never signalled."""
+    for jid in [i for i in _cancels_sent if (jobs.get(i) or {}).get("status") not in ("queued", "granted", "running")]:
+        _cancels_sent.pop(jid, None)
+        _stop_notes.pop(jid, None)
+    for job in list(jobs.values()):
+        if job["status"] in TERMINAL:
+            continue
+        jid = job["id"]
+        v2 = (job.get("v") or 1) >= 2
+        who = "its rq supervisor" if v2 else "its rq client"
+        if from_earlier_boot(job) and not (v2 and owner_alive(job)):
+            # its pids and process groups belong to other processes now: no liveness checks and no signals
+            new = update_job(jid, only_if=lambda j: j["status"] not in TERMINAL and from_earlier_boot(j)
+                             and not ((j.get("v") or 1) >= 2 and owner_alive(j)),
+                             status="lost", finished=time.time(), reason="the Mac restarted")
+            jobs[jid] = new or load_job(jid) or job
+            if new:
+                clear_flags(jid)
+                drop_stale_lock(jid)
+            continue
+        owner = owner_alive(job)
+        cancel = has_flag(jid, "cancel")
+        seen = {}
+        if job["status"] == "queued" and (not owner or (cancel and not v2)):
+            group = job_group(job)  # (a job paused in the queue has processes; one that never ran has none)
+            if group and jid not in _stop_notes:  # first they continue and stop; the record closes once they're gone
+                sent = _cancels_sent.get(jid)
+                if not sent:
+                    _cancels_sent[jid] = time.time()
+                    note = stop_frozen(job, group)
+                    if not note:
+                        continue
+                    _stop_notes[jid] = note  # they can't be signalled from here: close the record with that note
+                else:
+                    if time.time() - sent > CANCEL_KILL:
+                        try:
+                            signal_group(group, signal.SIGKILL)
+                        except OSError as e:
+                            print("rq: %s: could not stop its processes: %r" % (jid, e), flush=True)
+                    continue
+            note = _stop_notes.get(jid)
+
+            def still(j):
+                seen["cancel"], seen["owner"] = has_flag(jid, "cancel"), owner_alive(j)
+                return j["status"] == "queued" and (not seen["owner"] or (seen["cancel"] and not v2)) \
+                    and (not job_group(j) or jid in _stop_notes)
+
+            def reason(j):
+                where = "paused in the queue" if j.get("started") else "queued"
+                if v2 and not j.get("owner"):
+                    text = "its rq supervisor did not start (see rq log %s)" % jid
+                elif seen["cancel"]:
+                    text = "cancelled while " + where + ("" if seen["owner"] else "; %s is gone" % who)
+                else:
+                    text = "%s ended while the job was %s" % (who, where)
+                return text + ("; " + note if note else "")
+        elif not owner and not job_group(job):
+            def still(j):
+                seen["cancel"], seen["owner"] = has_flag(jid, "cancel"), False
+                return j["status"] not in TERMINAL and not owner_alive(j) and not job_group(j)
+
+            def reason(j):
+                if v2 and not j.get("owner"):
+                    return "its rq supervisor did not start (see rq log %s)" % jid
+                if not j.get("started"):
+                    return "%s; %s ended before the job started" % (
+                        "cancelled" if seen["cancel"] else "never started", who)
+                return "%s; %s ended before it recorded the result%s" % (
+                    "cancelled" if seen["cancel"] else "the job's processes are gone", who,
+                    " (see rq log %s)" % jid if v2 else "")
+        else:
+            if not owner and cancel:  # cancelled, nobody owns it, its processes still run: stop them here
+                group = job_group(job)  # (checked again right before each signal)
+                sent = _cancels_sent.get(jid)
+                try:
+                    if group and not sent:
+                        _cancels_sent[jid] = time.time()
+                        signal_group(group, signal.SIGCONT, signal.SIGTERM)
+                    elif group and time.time() - sent > CANCEL_KILL:
+                        signal_group(group, signal.SIGKILL)
+                except OSError as e:
+                    print("rq: %s: could not stop its processes: %r" % (jid, e), flush=True)
+            continue
+        new = update_job(jid, only_if=still, status=lambda j: "cancelled" if seen["cancel"] else "lost",
+                         finished=time.time(), reason=reason)
+        jobs[jid] = new or load_job(jid) or job
+        if new:
+            _cancels_sent.pop(jid, None)
+            _stop_notes.pop(jid, None)
+        if new and not seen["owner"]:
+            clear_flags(jid)
+            if v2:
+                drop_stale_lock(jid)
+
+
+def queue_view(jobs):
+    """The queues in the order they run, published in dispatcher.json, so waiting clients (rq run, rq wait, and
+    the light cap) need not read every record. The shape is the one rq clients of every version read: main and
+    light, the ids of the main and the light queue; running, {project, name} of the job with the main turn, or
+    None; light_running, a list of {project, name}."""
+    waiting = lambda light: [j["id"] for j in queue_order([
+        j for j in jobs.values() if j["status"] == "queued" and (j.get("kind") == "light") == light and waits(j)])]
+    brief = lambda j: {"project": j["project"], "name": j["name"]}
+    turn = jobs.get(granted() or "")
+    light_now = [j for j in jobs.values() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
+    return {"main": waiting(False), "light": waiting(True),
+            "running": brief(turn) if turn and turn["status"] not in TERMINAL else None,
+            "light_running": [brief(j) for j in light_now]}
+
+
+def continues_here(job):
+    """A job paused in the queue that the dispatcher continues itself on its turn: an older rq client's job moved
+    by rq move ID queue (that client doesn't look for the turn). A v2 job's supervisor continues its own job, as it
+    does after the light cap: the dispatcher only grants it."""
+    return bool(job.get("resume_by_dispatcher")) and (job.get("v") or 1) < 2 and bool(job_group(job))
+
+
+def continue_moved(job):
+    """Continue a job of an older client that is paused in the queue: running, its stop closed, SIGCONT (left
+    stopped, keeping its turn, if rq pause paused it too). Returns the new record, or None if it changed."""
+    now = time.time()
+    paused = has_flag(job["id"], "paused")
+    new = update_job(job["id"], only_if=lambda j: j["status"] == "queued", status="running", granted=now,
+                     resumed=now, **({} if paused else {"stopped": lambda j: close_stop(j, now)}))
+    group = job_group(new) if new and not paused else None
+    if group:
+        try:
+            signal_group(group, signal.SIGCONT)
+        except OSError as e:
+            print("rq: %s: could not continue it: %r" % (job["id"], e), flush=True)
+    return new
 
 
 def dispatch_once(state):
     jobs = {j["id"]: j for j in all_jobs()}
-    for job in jobs.values():
-        if job.get("kind") == "light" and job["status"] not in TERMINAL and not alive(job.get("client_pid")) \
-                and not group_alive(job.get("pgid")):
-            job.update(status="lost", finished=time.time())
-            save_job(job)
-    for job in jobs.values():  # queued light jobs whose session is gone or that were cancelled
-        if job.get("kind") == "light" and job["status"] == "queued" and (
-                not alive(job.get("client_pid")) or has_flag(job["id"], "cancel")):
-            job.update(status="cancelled" if has_flag(job["id"], "cancel") else "lost", finished=time.time())
-            save_job(job)
-    repair_grants(jobs)
-    dispatch_light(jobs)
+    if TEST_DISPATCH_DELAY:  # tests: the records read above go stale while their owners write
+        time.sleep(TEST_DISPATCH_DELAY)
+    try:
+        sweep(jobs)
+        repair_grants(jobs)
+        dispatch_light(jobs)
+        dispatch_main(state, jobs)
+    finally:
+        state["queue"] = queue_view(jobs)
+
+
+def dispatch_main(state, jobs):
     ours = [j for j in jobs.values() if j["status"] == "running" or (j["status"] == "queued" and j.get("pgid"))]
     grant = granted()
     note = ""
     if grant:
-        job = jobs.get(grant)
+        job = jobs.get(grant) or load_job(grant)
         if not job or job["status"] in TERMINAL:
-            os.remove(GRANT)
+            remove_turn(GRANT, grant)
             grant = None
-        elif not alive(job.get("client_pid")):
-            if job.get("pgid") and group_alive(job["pgid"]):
-                note = "%s: its rq client is gone, waiting for the job's processes to end" % grant
+        elif job["status"] == "queued":  # the turn names a job still in the queue: its grant was never finished
+            if continues_here(job) and owner_alive(job):  # (the dispatcher stopped between its writes)
+                new = continue_moved(job)
+                jobs[grant] = new or load_job(grant) or job
+                note = "continued %s" % grant if new else ""
             else:
-                job.update(status="lost", finished=time.time())
-                save_job(job)
-                os.remove(GRANT)
+                remove_turn(GRANT, grant)  # it gets its turn again, the usual way
                 grant = None
+        elif not owner_alive(job):  # (with its processes gone too, sweep() closed it)
+            note = "%s: its %s is gone, waiting for the job's processes to end" % (
+                grant, "rq supervisor" if (job.get("v") or 1) >= 2 else "rq client")
         elif job["status"] == "granted" and time.time() - job.get("granted", 0) > 120:
             note = "%s: granted but not started yet" % grant
     if grant:
-        job = jobs[grant]
         state["warnings"] = strays(ours)
         state["note"] = note or "running %s" % grant
         return
-    for job in jobs.values():  # queued jobs whose session is gone
-        if job["status"] == "queued" and job.get("kind") != "light" and (not alive(job.get("client_pid")) or has_flag(job["id"], "cancel")):
-            if job.get("pgid") and group_alive(job["pgid"]):  # a moved light job, paused: don't leave it frozen
-                try:
-                    os.killpg(job["pgid"], signal.SIGCONT)
-                    os.killpg(job["pgid"], signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            job.update(status="cancelled" if has_flag(job["id"], "cancel") else "lost", finished=time.time())
-            save_job(job)
-    queued = queue_order([j for j in all_jobs() if j["status"] == "queued" and j.get("kind") != "light"])
+    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and j.get("kind") != "light"
+                          and waits(j)])
     state["warnings"] = strays(ours)
+    stopping = sorted(i for i in _cancels_sent if (jobs.get(i) or {}).get("status") == "queued")
+    if queued and stopping:  # a frozen job nobody owns runs again until its processes end: not next to the next job
+        state["note"] = "waiting for the processes of %s to end" % ", ".join(stopping)
+        return
     found = [w for w in state["warnings"] if not w.get("low")]
     if not queued:
         if found:
@@ -1170,13 +2201,22 @@ def dispatch_once(state):
         state["note"] = "waiting for %d min without outside work (%ds so far)" % (QUIET_WINDOW // 60, quiet)
         return
     job = queued[0]
-    give_turn(GRANT, job["id"])
-    if job.get("resume_by_dispatcher") and group_alive(job.get("pgid")):  # moved from outside: continue it here
-        os.killpg(job["pgid"], signal.SIGCONT)
-        job.update(status="running", granted=time.time(), resumed=time.time(), stopped=close_stop(job))
-    else:
-        job.update(status="granted", granted=time.time())
-    save_job(job)
+    now = time.time()
+    if continues_here(job):  # an older client's job, moved by rq move ID queue: the dispatcher continues it
+        give_turn(GRANT, job["id"])  # (the turn first: once it runs again it holds the turn; see the grant above)
+        new = continue_moved(job)
+        if not new:
+            remove_turn(GRANT, job["id"])
+    else:  # the record first: its owner starts the job (or continues it, if it is paused in the queue) as soon as
+        # the turn file names it
+        new = update_job(job["id"], only_if=lambda j: j["status"] == "queued" and not has_flag(j["id"], "cancel"),
+                         status="granted", granted=now)
+        if new:
+            give_turn(GRANT, job["id"])
+    if not new:
+        state["note"] = "%s changed before it got its turn" % job["id"]
+        return
+    jobs[job["id"]] = new
     first = [i for i in (read_json(ORDER, []) or []) if i != job["id"]]
     write_json(ORDER, first)
     state["note"] = "granted %s" % job["id"]
@@ -1192,19 +2232,22 @@ def cmd_daemon(args):
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Page)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    threading.Thread(target=artifact_indexer, daemon=True).start()
+    shutil.rmtree(os.path.join(STATE, "artifacts"), ignore_errors=True)  # what an older rq guessed jobs produced
     print("rq: dispatcher running, status page on http://localhost:%d" % args.port, flush=True)
-    state = {"pid": os.getpid(), "since": time.time(), "port": args.port, "outside_seen": time.time()}
+    state = {"pid": os.getpid(), "proto": PROTO, "since": time.time(), "port": args.port,
+             "outside_seen": time.time()}
+    tidied = 0
     while True:
         try:
             dispatch_once(state)
         except Exception as e:  # keep dispatching; show the error on the page
             state["note"] = "error: %r" % e
-        try:
-            state["queue"] = queue_view(all_jobs())  # waiting clients read their place here, not every record
-        except Exception as e:
-            state.pop("queue", None)
-            state["queue_error"] = repr(e)
+        if time.time() - tidied > 60:
+            tidied = time.time()
+            try:
+                tidy_watchers()
+            except Exception as e:
+                print("rq: tidying watch files: %r" % e, flush=True)
         try:
             util, gpu_cores = gpu_sample()
             if util is not None:
@@ -1215,7 +2258,9 @@ def cmd_daemon(args):
             state["gpu"] = {"error": repr(e)}
         if time.time() - state.get("usage", {}).get("at", 0) >= 5:
             try:
-                state["sessions"] = session_states()
+                found = {}
+                state["sessions"] = session_states(found)
+                state["claude"] = found  # (for "session ended"; snapshot() keeps it off the page)
             except Exception as e:
                 state["sessions"] = []
                 state["sessions_error"] = repr(e)
@@ -1228,201 +2273,1032 @@ def cmd_daemon(args):
         time.sleep(TICK)
 
 
+def tidy_watchers():
+    """Remove the watch files of watchers that ended, once their job has ended too and nobody owns it (a job's
+    supervisor removes those it knows of when the job ends; these are left from killed `rq wait`s), and the lock
+    files nobody holds of jobs that ended (left by a supervisor that never took over)."""
+    for path in glob.glob(os.path.join(WATCH, "*.json")):
+        job = load_job(os.path.basename(path).rsplit(".", 2)[0])
+        try:
+            old = time.time() - os.path.getmtime(path) > 60
+        except OSError:
+            continue
+        if old and (not job or (job["status"] in TERMINAL and owner_done(job))) and not lock_held(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    for path in glob.glob(os.path.join(OWNERS, "*.lock")):
+        job_id = os.path.basename(path)[:-5]
+        job = load_job(job_id)
+        try:
+            old = time.time() - os.path.getmtime(path) > 60
+        except OSError:
+            continue
+        if old and (not job or job["status"] in TERMINAL):
+            drop_stale_lock(job_id)  # (only if nobody holds it)
+
+
 def cmd_start(args):
     """Start the dispatcher detached in its own session, so it outlives the shell and session that started it."""
     if dispatcher_state()["alive"]:
         print("rq: the dispatcher is already running (pid %s)" % dispatcher_state()["pid"])
         return
-    if os.fork():
-        for _ in range(30):
-            time.sleep(0.5)
-            d = dispatcher_state()
-            if d["alive"] and d.get("since", 0) > time.time() - 60:
-                break
-        print("rq: dispatcher %s, status page on http://localhost:%d" % (
-            "running (pid %s)" % d["pid"] if d["alive"] else "did not start, see " + os.path.join(STATE, "daemon.out"),
-            args.port))
-        return
-    os.setsid()
-    if os.fork():
-        os._exit(0)
-    out = os.open(os.path.join(STATE, "daemon.out"), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-    os.dup2(out, 1)
-    os.dup2(out, 2)
-    os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
-    os.execv(os.path.realpath(__file__), [os.path.realpath(__file__), "daemon", "--port", str(args.port)])
+    detach([sys.executable, RQ_PATH, "daemon", "--port", str(args.port)], os.path.join(STATE, "daemon.out"))
+    for _ in range(30):
+        time.sleep(0.5)
+        d = dispatcher_state()
+        if d["alive"] and d.get("since", 0) > time.time() - 60:
+            break
+    print("rq: dispatcher %s, status page on http://localhost:%d" % (
+        "running (pid %s)" % d["pid"] if d["alive"] else "did not start, see " + os.path.join(STATE, "daemon.out"),
+        args.port))
 
 
-# ---------- client: rq run ----------
+# ---------- rq run, rq light: submit, then watch ----------
+
+def quiet_stdout():
+    """Nobody reads the client's output any more (rq run ... | head): from now on it goes nowhere, and the job and
+    its log carry on."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except OSError:
+        pass
+
 
 def say(text):
-    sys.stdout.write("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text))
-    sys.stdout.flush()
+    try:
+        sys.stdout.write("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text))
+        sys.stdout.flush()
+    except OSError:
+        quiet_stdout()
+
+
+def signal_name(signum):
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return "signal %s" % signum
+
+
+def rq_cmd(*words):
+    """An rq command line to suggest to a session, with this rq's full path."""
+    return " ".join([RQ_PATH] + list(words))
+
+
+def result_line(job):
+    """How a job ended, in one line: done ID: exit 0 after 5m (and the reason, if it has one). A job killed by a
+    signal: killed by SIGTERM (exit 143), the code rq run and rq wait exit with."""
+    text = "%s %s" % (job.get("status"), job.get("id"))
+    code = job.get("exit")
+    if code is not None:
+        text += ": exit %d" % code if code >= 0 else ": killed by %s (exit %d)" % (signal_name(-code), 128 - code)
+    if job.get("ran") is not None:
+        text += " after %s" % fmt_duration(job["ran"])
+    if job.get("reason"):
+        text += " (%s)" % job["reason"]
+    return text
+
+
+# What rq run and rq wait exit with, besides the job's own code (see exit_code). 128+n for signal n also means
+# "stopped watching" when the watcher itself got signal n (143 for SIGTERM, a TaskStop): its last line says which.
+EXIT_LOST = 75  # the job was lost: its owner and its processes ended and nobody recorded a result
+EXIT_ORPHANED = 128 + signal.SIGHUP  # 129: the session this watcher reported to ended; the job carries on
+EXIT_NO_OUTPUT = 141  # nobody reads the watcher's output any more (rq run ... | head); the job carries on
+EXIT_USAGE = 64  # refused: no --output and no --no-output (or both), an --output rq can't show, or a --project that
+# isn't one folder name; nothing queued
+EXIT_DUPLICATE = 65  # refused: an identical job is still queued or running and no task watches it; nothing queued
+EXIT_NO_RECORD = 66  # the job has no record
+EXIT_OLD_DISPATCHER = 69  # refused: the dispatcher is an older rq; nothing queued
+EXIT_NO_SUPERVISOR = 70  # the job's rq supervisor could not start; the job failed without running
+
+
+def exit_code(job):
+    """What rq run and rq wait exit with once a job has ended: 0 done; the job's code if it failed, 128+n if a
+    signal n ended it (also a job cancelled while it ran: 143 for SIGTERM, 137 for SIGKILL); 130 cancelled before
+    it ran; 75 lost."""
+    status, code = job.get("status"), job.get("exit")
+    if status == "done":
+        return 0
+    if status == "lost":
+        return EXIT_LOST
+    if code:
+        return code if code > 0 else 128 - code
+    return 130 if status == "cancelled" else 1
+
+
+def stopped_line(job):
+    """The line a watcher leaves when it stops watching a job that has not ended."""
+    jid = job.get("id")
+    what = job_what(job) if job.get("status") else "running"
+    if what.startswith("being cancelled"):
+        return "stopped watching %s; the job is %s (%s follows it to its end)" % (jid, what, rq_cmd("wait", jid))
+    still = {"queued": "the job stays queued", "paused in the queue": "the job stays paused in the queue",
+             "starting": "the job starts all the same"}.get(what, "the job keeps running")
+    return "stopped watching %s; %s (%s to watch again, %s to stop it)" % (
+        jid, still, rq_cmd("wait", jid), rq_cmd("cancel", jid))
+
+
+def submitter(project):
+    """Who submitted a job: the Claude Code session (its id and process) and the task output it was watched from."""
+    pid = claude_pid()
+    return {"session_id": os.environ.get("CLAUDE_CODE_SESSION_ID") or None, "claude_pid": pid,
+            "claude_start": proc_start(pid), "task_output": output_path(), "project": project, "pid": os.getpid()}
+
+
+def live_jobs_named(project, name):
+    """This project's jobs with this name that haven't ended (leaving out those being cancelled, and those nobody
+    owns any more: the dispatcher closes them). Only jobs of the last 7 days: no need to read every record."""
+    return [j for j in recent_jobs(7) if j["status"] not in TERMINAL and j.get("project") == project
+            and j.get("name") == name and not has_flag(j["id"], "cancel") and not from_earlier_boot(j)
+            and owner_alive(j)]
+
+
+def cancel_job(job, reason):
+    """Cancel a job: the reason in its record, its cancel flag, and SIGCONT + SIGTERM to its processes unless its
+    rq supervisor is there to send them (never to a process group that isn't the job's any more, see job_group).
+    Its owner records the end. Returns the PermissionError if its processes could not be signalled from here, else
+    None."""
+    update_job(job["id"], only_if=lambda j: j["status"] not in TERMINAL, cancel_reason=reason)
+    set_flag(job["id"], "cancel")
+    job = load_job(job["id"]) or job
+    if from_earlier_boot(job) or ((job.get("v") or 1) >= 2 and owner_alive(job)):
+        return None
+    group = job_group(job)
+    try:
+        signal_group(group, signal.SIGCONT, signal.SIGTERM)
+    except PermissionError as e:
+        return e
+    return None
+
+
+def claim_id(project, name):
+    """A new job id with its owner lock, created for it (O_EXCL) and flocked: never the id of another job. An id is
+    the second, the project and name, and 3 random letters, so two submissions in the same second can draw the
+    same one; then it draws again."""
+    for _ in range(100):
+        job_id = new_id(project, name)
+        if os.path.exists(job_path(job_id)):
+            continue
+        try:
+            fd = os.open(owner_lock(job_id), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        if os.path.exists(job_path(job_id)):  # (an older rq client, which takes no lock, wrote that id meanwhile)
+            os.unlink(owner_lock(job_id))
+            os.close(fd)
+            continue
+        return job_id, fd
+    raise RuntimeError("no free job id for %s/%s" % (project, name))
+
+
+def same_outputs(job, outputs, no_output):
+    """Whether a job declares these outputs (in any order), or --no-output as well."""
+    paths = lambda outs: sorted((o.get("kind"), o.get("path")) for o in outs or [])
+    return bool(job.get("no_output")) == bool(no_output) and paths(job.get("outputs")) == paths(outputs)
+
+
+def output_words(job):
+    """A job's declared outputs as rq run's arguments, for a message."""
+    if job.get("no_output"):
+        return "--no-output"
+    return " ".join("-o " + (o.get("declared") or o.get("path") or "?") for o in job.get("outputs") or []) \
+        or "no outputs"
+
+
+def set_outputs(job_id, outputs, no_output):
+    """Declare a job's outputs anew while it hasn't ended (what its sheet shows; the job itself doesn't change)."""
+    with jobs_lock():
+        job = load_job(job_id)
+        if not job or job["status"] in TERMINAL:
+            return None
+        job.pop("outputs", None)
+        job.pop("no_output", None)
+        if outputs:
+            job["outputs"] = outputs
+        if no_output:
+            job["no_output"] = True
+        save_job(job)
+        return job
 
 
 def cmd_run(args):
+    """rq run / rq light: submit the job to its own rq supervisor (detached, so the session's task can't kill it),
+    then watch it until it ends (unless --detach)."""
     setup()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
-        sys.exit("rq run: no command (rq run --name NAME -- COMMAND)")
+        sys.exit("rq %s: no command. For example: %s (or --no-output in place of --output PATH, for a job that writes "
+                 "no pictures or videos)" % (args.cmd, rq_cmd(args.cmd, "--name", "NAME", "--output", "PATH", "--",
+                                                              "COMMAND")))
+    project = args.project or project_of(os.getcwd()) or "unknown"
+    if not plain_project(project):
+        print("rq: %s. Nothing was queued." % PROJECT_HELP, file=sys.stderr)
+        return EXIT_USAGE
+    cwd = os.getcwd()
+    try:  # before anything is written: this refusal is how a session learns to say where its job writes
+        outputs = declare_outputs(args.outputs or [], args.no_output, cwd, project)
+    except OutputError as e:
+        print("rq: %s. Nothing was queued." % e, file=sys.stderr)
+        words = command[0].split() if len(command) == 1 else command
+        late = next((w for w in words if w in ("--output", "-o", "--no-output") or w.startswith("--output=")), None)
+        if late and not args.outputs and not args.no_output:
+            print("(The %s after COMMAND is part of the command, not an option of rq: rq's own options go before "
+                  "-- COMMAND.)" % late.split("=")[0], file=sys.stderr)
+        if not args.outputs and not args.no_output:
+            est = ["--estimate", "45m"] if args.cmd == "run" else []
+            print("For example:\n  %s\n  %s\n  %s\nA relative PATH is from the folder rq runs in; it must be inside "
+                  "the project's folder or its Claude Code scratchpad." % (
+                      rq_cmd(args.cmd, "--name", "NAME", *est, "--output", "renders/final.mp4", "--", "COMMAND"),
+                      rq_cmd(args.cmd, "--name", "NAME", *est, "--output", "'renders/frames/####.png'", "--output",
+                             "renders/preview/", "--", "COMMAND"),
+                      rq_cmd(args.cmd, "--name", "NAME", *est, "--no-output", "--", "COMMAND")), file=sys.stderr)
+        return EXIT_USAGE
     argv = ["/bin/zsh", "-c", command[0]] if len(command) == 1 else command
     light = args.cmd == "light"
     if light:  # the light queue: one at a time, at low priority, never holds the main queue
         argv = ["nice", "-n", str(QUIET_NICE)] + argv
-    project = args.project or project_of(os.getcwd()) or "unknown"
-    job = {"id": new_id(project, args.name), "project": project, "name": args.name, "cwd": os.getcwd(),
-           "command": " ".join(command), "estimate": parse_duration(args.estimate), "client_pid": os.getpid(),
-           "submitted": time.time(), "status": "queued", "kind": "light" if light else "heavy"}
+    d = dispatcher_state()
+    if d["alive"] and (d.get("proto") or 1) < PROTO:
+        print("rq: the dispatcher (pid %s) runs an older rq that would overwrite this job's record. Restart the "
+              "dispatcher first (the queue session: kill %s, then %s). Nothing was queued."
+              % (d.get("pid"), d.get("pid"), rq_cmd("start")), file=sys.stderr)
+        return EXIT_OLD_DISPATCHER
+    text = " ".join(command)
+    named = live_jobs_named(project, args.name)
+    same = [j for j in named if j.get("cwd") == cwd and j.get("command") == text]  # an identical job
+    others = []  # the same name, from another folder or with another command, and no task of its session watches it
+    if named and args.replace:  # the same name: also a changed command, or one run from a new snapshot
+        for j in named:
+            err = cancel_job(j, "rq run --replace")
+            say("cancelling %s, which this job replaces%s" % (
+                j["id"], "" if not err else " (its processes could not be signalled from here: %s)" % err))
+    else:
+        lone = [j for j in same if not own_watchers(j)]
+        if lone and not args.again:
+            j, note = lone[0], ""
+            if not same_outputs(j, outputs, args.no_output):  # the same job, declared differently: this call is newer
+                if submitter_sid(j) == (os.environ.get("CLAUDE_CODE_SESSION_ID") or None) and \
+                        set_outputs(j["id"], outputs, args.no_output):
+                    note = "; it now declares this call's outputs (it declared %s)" % output_words(j)
+                else:
+                    note = "; it declares other outputs than this call (%s)" % output_words(j)
+            print("rq: job %s is still %s (stopping a task does not cancel it)%s: %s to follow it, %s to stop it. "
+                  "Nothing was queued (--again queues another copy anyway, --replace cancels it first)."
+                  % (j["id"], j["status"], note, rq_cmd("wait", j["id"]), rq_cmd("cancel", j["id"])),
+                  file=sys.stderr)
+            return EXIT_DUPLICATE
+        ids = {j["id"] for j in same}
+        others = [j for j in named if j["id"] not in ids and not own_watchers(j)]
+    pending = {"signal": None}
+
+    def later(signum, frame):  # stopped while submitting: the job is submitted all the same, then rq run ends
+        pending["signal"] = pending["signal"] or signum
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, later)
+    # The owner lock before the record: from the moment the job exists it has an owner. The supervisor gets this
+    # very open file, so the lock passes to it without a gap, whenever this process ends.
+    job_id, lock = claim_id(project, args.name)
+    log_path = os.path.join(LOGS, job_id + ".log")
+    job = {"id": job_id, "v": 2, "project": project, "name": args.name, "cwd": cwd, "command": text, "argv": argv,
+           "estimate": parse_duration(args.estimate), "client_pid": os.getpid(), "submitted": time.time(),
+           "status": "queued", "kind": "light" if light else "heavy", "submitter": submitter(project),
+           "boot": boot_id()}
+    if outputs:
+        job["outputs"] = outputs  # (what the sheet shows: what is at these paths when it is opened)
+    if args.no_output:
+        job["no_output"] = True
     try:
-        job["tools"] = detect_tools(job["command"], job["cwd"])
+        job["tools"] = detect_tools(text, cwd)
     except Exception:
         job["tools"] = []
-    save_job(job)
-    log_path = os.path.join(LOGS, job["id"] + ".log")
     open(log_path, "w").close()
-    state = {"job": job, "pgid": None}
-
-    def stop(signum, frame):
-        if state["pgid"]:
-            set_flag(job["id"], "cancel")
-            try:
-                os.killpg(state["pgid"], signal.SIGCONT)
-                os.killpg(state["pgid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        else:
-            current = load_job(job["id"]) or job
-            current.update(status="cancelled", finished=time.time())
-            save_job(current)
-            say("cancelled while queued")
-            sys.exit(130)
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(s, stop)
-
-    say("%s %s" % ("light job, queued for the light slot:" if light else "queued", job["id"]))
-    say("status page: http://localhost:%d" % (dispatcher_state().get("port") or PORT))
-    last, warned, place_cache = None, False, {}
-    turn_file = GRANT_LIGHT if light else GRANT
-    while True:
-        if has_flag(job["id"], "cancel"):
-            current = load_job(job["id"]) or job
-            current.update(status="cancelled", finished=time.time())
-            save_job(current)
-            say("cancelled while queued")
-            return 130
-        if granted(turn_file) == job["id"]:
-            break
-        position, r, d = queue_place(job["id"], light, place_cache)
-        if not d["alive"] and not warned:
-            say("warning: the rq dispatcher isn't running; still waiting (the queue session starts it with rq start)")
-            warned = True
-        status = "waiting%s" % (" for the light slot" if light else "") + (", position %s" % position if position else "")
-        if r:
-            status += ", %s now: %s/%s" % ("light job" if light else "rendering", r["project"], r["name"])
-        elif not light and d.get("note", "").startswith("waiting"):
-            status += ", " + d["note"]
-        if status != last:
-            say(status)
-            last = status
-        time.sleep(1)
-
-    job = load_job(job["id"]) or job
-    say("starting: %s (in %s)" % (job["command"], job["cwd"]))
-    with open(log_path, "ab") as log:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        state["pgid"] = proc.pid
-        job.update(status="running", started=time.time(), pid=proc.pid, pgid=proc.pid)
-        save_job(job)
-        subprocess.Popen(["caffeinate", "-i", "-w", str(proc.pid)])
-        if light:
-            threading.Thread(target=cap_light, args=(job["id"], proc), daemon=True).start()
-        fd = proc.stdout.fileno()
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.flush()
-            log.write(chunk)
-            log.flush()
-        code = proc.wait()
-    job = load_job(job["id"]) or job
-    cancelled = has_flag(job["id"], "cancel")
-    job.update(status="cancelled" if cancelled else ("done" if code == 0 else "failed"), exit=code,
-               finished=time.time())
     save_job(job)
-    for kind in ("cancel", "paused", "keep"):
-        set_flag(job["id"], kind, False)
-    say("%s %s: exit %d after %s" % (job["status"], job["id"], code, fmt_duration(job["finished"] - job["started"])))
-    return code if code >= 0 else 128 - code
+    pid = detach([sys.executable, RQ_PATH, "_supervise", job_id, "--lock-fd", str(lock)], log_path, keep_fd=lock)
+    os.close(lock)
+    t0, owner = time.time(), None
+    while time.time() - t0 < START_WAIT:
+        owner = (load_job(job_id) or {}).get("owner")
+        if owner or not lock_held(owner_lock(job_id)):
+            break
+        time.sleep(0.05)
+    if not owner:
+        update_job(job_id, only_if=lambda j: j["status"] not in TERMINAL and not j.get("owner"), status="failed",
+                   finished=time.time(), reason="could not start its rq supervisor (see rq log %s)" % job_id)
+        if not (load_job(job_id) or {}).get("owner"):
+            say("job %s failed: could not start its rq supervisor%s; its log: %s" % (
+                job_id, "" if pid else " (fork failed)", rq_cmd("log", job_id)))
+            return EXIT_NO_SUPERVISOR
+    if args.detach:
+        say("job %s submitted, not watched (--detach): %s follows it and exits with its exit code; %s cancels it."
+            % (job_id, rq_cmd("wait", job_id), rq_cmd("cancel", job_id)))
+    else:
+        say("job %s. This task only watches it: stopping the task does not cancel the job; %s does." % (
+            job_id, rq_cmd("cancel", job_id)))
+    for j in others:
+        print("rq: note: job %s with this name is still %s (from another folder or with another command); it was "
+              "not cancelled. %s follows it, %s stops it, or submit with --replace to cancel it first."
+              % (j["id"], job_what(j), rq_cmd("wait", j["id"]), rq_cmd("cancel", j["id"])),
+              file=sys.stderr)
+    if pending["signal"]:
+        say(stopped_line(load_job(job_id) or job))
+        return 128 + pending["signal"]
+    if args.detach:
+        return 0
+    say("status page: http://localhost:%d" % (d.get("port") or PORT))
+    return watch(job_id, pending=pending)
+
+
+# ---------- watching: rq run, rq wait ----------
+
+def read_from(path, pos, limit=1 << 20):
+    try:
+        with open(path, "rb") as f:
+            f.seek(pos)
+            data = f.read(limit)
+    except OSError:
+        return pos, b""
+    return pos + len(data), data
+
+
+def log_tail(path, lines, end=None):
+    """The last lines of a log, split at carriage returns too (progress lines), at most about 4 KB."""
+    try:
+        end = os.path.getsize(path) if end is None else end
+        with open(path, "rb") as f:
+            start = max(0, end - 65536)
+            f.seek(start)
+            data = f.read(end - start).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    parts = re.split(r"\r\n|\r|\n", data)
+    if start:
+        parts = parts[1:]  # it started mid-line
+    parts = [p for p in parts if p.strip()][-max(lines, 0):] if lines else []
+    text = "\n".join(parts)
+    if len(text) > 4096:
+        text = text[-4096:]
+        text = text[text.find("\n") + 1:] if "\n" in text else text
+    return text + "\n" if text else ""
+
+
+def queue_status(job, cache):
+    """A queued job's place in its queue, from what the dispatcher publishes in dispatcher.json (no need to read
+    every record); from a dispatcher that publishes no queue, a full snapshot at most every 15 s."""
+    d = dispatcher_state()
+    if not d["alive"]:
+        return "waiting; the rq dispatcher isn't running (the queue session starts it with rq start)"
+    q = d.get("queue")
+    if not isinstance(q, dict):
+        if time.time() - cache.get("at", 0) >= 15:
+            snap = snapshot()
+            cache.update(at=time.time(), q={"main": [j["id"] for j in snap["queued"]],
+                                            "light": [j["id"] for j in snap["light_queued"]],
+                                            "running": snap["running"], "light_running": snap["light"]})
+        q = cache.get("q") or {}
+    light = job.get("kind") == "light"
+    line = q.get("light" if light else "main") or []
+    text = "%s%s%s" % ("paused, waiting in the queue" if job.get("started") else "waiting",
+                       " for the light slot" if light else "",
+                       ", position %d" % (line.index(job["id"]) + 1) if job["id"] in line else "")
+    now = q.get("light_running") if light else q.get("running")
+    if isinstance(now, list):
+        now = now[0] if now else None
+    if isinstance(now, dict):  # {project, name}; (a plain "project/name" too)
+        now = "%s/%s" % (now.get("project"), now.get("name"))
+    if now:
+        text += ", %s now: %s" % ("light job" if light else "rendering", now)
+    elif not light and (d.get("note") or "").startswith("waiting"):
+        text += ", " + re.sub(r" \(\d+s so far\)", "", d["note"])
+    return text
+
+
+def collect(job_id, info):
+    """The result reached the session that queued the job (a task of it, or any watcher if the job names no
+    session): rq mine and the page don't offer it again. A terminal or another session following the job doesn't
+    count: the session that queued it still needs it."""
+    if not session_alive(info, check_start=False):
+        return
+
+    def theirs(j):
+        sid = submitter_sid(j)
+        return not j.get("collected_at") and (not sid or watches_for(info, sid))
+    update_job(job_id, only_if=theirs, collected_at=time.time())
+
+
+def owner_done(job):
+    """Whether a job's owner has let go of its record: its lock is free (v2), or its client is gone (an older
+    record). An older record that ended more than 2 s ago counts too: its client exits right after its last write,
+    so a live process with that pid is another process by now."""
+    if not owner_alive(job):
+        return True
+    return (job.get("v") or 1) < 2 and job["status"] in TERMINAL and time.time() - (job.get("finished") or 0) > 2
+
+
+def watch(job_id, offset=0, seen=b"", pending=None):
+    """Follow a job: its place in the queue while it waits, then its output from the log, until its owner has
+    recorded the end; then exit with its exit code. It only watches: stopping it (TaskStop, a timeout, its session
+    or the app ending) leaves the job and its record alone. It registers in state/watch, so the job counts as
+    watched, and it ends by itself once the Claude Code session it reports to is gone. pending: a signal rq run
+    got while it submitted the job."""
+    log_path = os.path.join(LOGS, job_id + ".log")
+    ctx = {"path": None, "info": None, "pos": offset}
+
+    def forget():
+        try:
+            if ctx["path"]:
+                os.remove(ctx["path"])
+        except OSError:
+            pass
+
+    def stopped(signum, frame):  # never a signal to the job or a change to its record but collected_at
+        code = 128 + signum
+        try:
+            job = load_job(job_id) or {"id": job_id}
+            if job.get("status") in TERMINAL:  # it has ended, and this watcher hasn't shown it yet: show it now
+                pos, data = read_from(log_path, ctx["pos"], 65536)
+                os.write(1, data + ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), result_line(job))).encode())
+                if ctx["info"]:
+                    collect(job_id, ctx["info"])
+                forget()
+                code = exit_code(job)
+            else:
+                os.write(1, ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), stopped_line(job))).encode())
+        except Exception:
+            pass
+        os._exit(code)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, stopped)
+    if pending and pending.get("signal"):  # (it came after rq run last looked)
+        stopped(pending["signal"], None)
+
+    info = {"pid": os.getpid(), "claude_pid": claude_pid(), "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or None, "task_output": output_path(), "since": time.time()}
+    info["claude_start"] = proc_start(info["claude_pid"])
+    path = os.path.join(WATCH, "%s.%d.json" % (job_id, os.getpid()))
+    fd = os.open(path + ".tmp", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # locked before it has its name, and for as long as this process watches
+    os.write(fd, json.dumps(info).encode())
+    os.rename(path + ".tmp", path)
+    ctx.update(path=path, info=info)
+
+    def emit(data):
+        try:
+            while data:
+                data = data[os.write(1, data):]
+        except OSError:  # nobody reads this output any more (rq run ... | head): stop watching, quietly
+            forget()
+            os._exit(EXIT_NO_OUTPUT)
+
+    def line(text):
+        emit(("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text)).encode())
+
+    pos, recent = offset, seen[-4096:]
+    last, lost_since, next_check, place_cache = None, None, time.time() + 10, {}
+    while True:
+        job = load_job(job_id)
+        pos, data = read_from(log_path, pos)
+        if data:
+            emit(data)
+            recent = (recent + data)[-4096:]
+        ctx["pos"] = pos
+        if not job:
+            line("job %s has no record" % job_id)
+            forget()
+            return EXIT_NO_RECORD
+        if job["status"] in TERMINAL and owner_done(job):
+            while True:  # the rest of the log: its owner wrote it all before it let go of the lock
+                pos, data = read_from(log_path, pos)
+                if not data:
+                    break
+                emit(data)
+                recent = (recent + data)[-4096:]
+                ctx["pos"] = pos
+            text = result_line(job)
+            if text.encode() not in recent:  # (the supervisor logs it; older records and the dispatcher don't)
+                line(text)
+            collect(job_id, info)
+            forget()
+            return exit_code(job)
+        if job["status"] not in TERMINAL and not owner_alive(job) and not job_group(job):
+            lost_since = lost_since or time.time()
+            if time.time() - lost_since >= LOST_AFTER:
+                line("lost %s: its owner and the job's processes are gone, and nobody recorded a result" % job_id)
+                forget()
+                return EXIT_LOST
+        else:
+            lost_since = None
+        if job["status"] == "queued":
+            status = queue_status(job, place_cache)
+            if status != last:
+                line(status)
+                last = status
+        else:
+            last = None
+        orphaned = os.getppid() == 1 or not session_alive(info, check_start=False)
+        if not orphaned and time.time() > next_check:
+            next_check = time.time() + 10
+            orphaned = not session_alive(info)
+        if orphaned:  # the session this task reported to is gone: nobody reads this; the job carries on
+            line("the session that started this task is gone: " + stopped_line(job))
+            return EXIT_ORPHANED  # (its watch file stays: the supervisor notes the result in this task's output file)
+        time.sleep(0.5)
+
+
+def cmd_wait(args):
+    """rq wait ID: watch a job again. The last lines of its log, then its output from there; for a job that has
+    ended, its result at once. Never cancels anything."""
+    job = find_job(args.id)
+    path = os.path.join(LOGS, job["id"] + ".log")
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    tail = log_tail(path, args.n, size).encode()
+    if tail:
+        try:
+            os.write(1, tail)
+        except OSError:
+            return EXIT_NO_OUTPUT
+    return watch(job["id"], offset=size, seen=tail)
+
+
+def recent_jobs(days):
+    """The records of jobs submitted in the last days, picked by the date in their id (%m%d-%H%M%S) without reading
+    the others."""
+    now = time.time()
+    year = time.localtime(now).tm_year
+    out = []
+    for name in os.listdir(JOBS):
+        if not name.endswith(".json"):
+            continue
+        m = re.match(r"^(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)-", name)
+        if m:
+            parts = tuple(int(x) for x in m.groups())
+            try:
+                t = time.mktime((year,) + parts + (0, 0, -1))
+                if t > now + 86400:  # December's jobs, read in January
+                    t = time.mktime((year - 1,) + parts + (0, 0, -1))
+            except (OverflowError, ValueError):
+                t = now
+            if now - t > days * 86400:
+                continue
+        job = read_json(os.path.join(JOBS, name))
+        if job:
+            out.append(job)
+    return out
+
+
+UNSEEN_GRACE = 10  # seconds a watcher that was live at a job's end has to show its result
+
+
+def unseen(job, now):
+    """A job that ended in the last 24 h whose result did not reach the session that queued it (no task of that
+    session collected it). A watcher of that session that was live at the end (watched_at_end) gets a few seconds
+    to show the result first; one stopped or killed in that time never shows it."""
+    if job["status"] not in TERMINAL or job.get("collected_at") or now - (job.get("finished") or 0) > 86400:
+        return False
+    if job.get("cancel_reason") == "rq run --replace":
+        return False  # its session replaced it itself
+    if (job.get("v") or 1) >= 2:
+        return not job.get("watched_at_end") or now - (job.get("finished") or 0) > UNSEEN_GRACE
+    # an older client's job: its client showed the result, unless the dispatcher closed it. A lost record of an
+    # older dispatcher has no reason and its session was told long ago (or it really finished: the old race)
+    return job["status"] == "lost" and bool(job.get("reason"))
+
+
+def cmd_mine(args):
+    """rq mine: this session's jobs (by its session id, from the env or a hook's JSON on stdin; else the project of
+    its folder) that need it: jobs not ended that no task watches, and results nobody has seen. Prints nothing if
+    there are none, and always exits 0, so it can run as a SessionStart or UserPromptSubmit hook."""
+    try:
+        hook = {}
+        if args.hook:
+            try:
+                if not sys.stdin.isatty() and select.select([sys.stdin], [], [], 2)[0]:
+                    hook = json.loads(sys.stdin.read() or "{}")
+            except (OSError, ValueError):
+                hook = {}
+            hook = hook if isinstance(hook, dict) else {}
+        sid = hook.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+        project = project_of(hook.get("cwd") or os.getcwd())
+        now = time.time()
+        lines, by_project = [], False
+        for job in sorted(recent_jobs(7), key=lambda j: j.get("submitted") or 0):
+            owner_sid = submitter_sid(job)
+            if sid and owner_sid:
+                if owner_sid != sid:
+                    continue
+            elif not project or job.get("project") != project:
+                continue
+            jid, name = job["id"], job.get("name")
+            if job["status"] not in TERMINAL:
+                if from_earlier_boot(job):
+                    continue
+                what = job_what(job)
+                if being_cancelled(job):
+                    if not args.unwatched:
+                        lines.append("job %s (%s) is %s; it ends soon." % (jid, name, what))
+                        by_project = by_project or not owner_sid
+                    continue
+                if own_watchers(job):
+                    if not args.unwatched:
+                        lines.append("job %s (%s) is %s; a task of this session watches it." % (jid, name, what))
+                        by_project = by_project or not owner_sid
+                    continue
+                lines.append("job %s (%s) is %s and no task of this session watches it. It was not cancelled, so "
+                             "don't resubmit it: to follow it and get its exit code, run `%s` as a background task."
+                             % (jid, name, what, rq_cmd("wait", jid)))
+            elif unseen(job, now):
+                code = job.get("exit")
+                how = job["status"] + ("" if code is None else ", exit %d" % code if code >= 0 else
+                                       ", killed by %s" % signal_name(-code)) + \
+                    (" (%s)" % job["reason"] if job.get("reason") else "")
+                lines.append("job %s (%s) ended at %s and no task of this session showed its result: %s. Don't "
+                             "resubmit it before you looked: `%s` shows its last output and exits with its exit code."
+                             % (jid, name, fmt_time(job.get("finished")), how, rq_cmd("wait", jid)))
+            else:
+                continue
+            by_project = by_project or not owner_sid
+        if lines:
+            print("rq (the render queue): jobs of this session" + (
+                " (some found by project: they don't say which session queued them)" if by_project else "") + ":")
+            print("\n".join("- " + text for text in lines))
+    except Exception:
+        if not args.hook:
+            raise
+    return 0
+
+
+# ---------- the supervisor: rq _supervise ----------
+
+def cmd_supervise(args):
+    """rq _supervise ID --lock-fd N, started detached by rq run with its owner lock (see Supervisor)."""
+    sig = {"n": None}
+
+    def on_signal(signum, frame):  # a Python handler, not SIG_IGN: the job must start with the default handling
+        sig["n"] = sig["n"] or signum
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+    job_id, fd = args.id, args.lock_fd
+    try:
+        handed = os.fstat(fd).st_ino == os.stat(owner_lock(job_id)).st_ino
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # rq run's lock, the same open file: already ours
+        os.set_inheritable(fd, False)
+    except OSError:
+        handed = False
+    if not handed:
+        say("rq supervisor of %s: rq run handed over no owner lock; not starting" % job_id)
+        return 1
+    sup = Supervisor(job_id, fd, sig)
+    me = {"pid": os.getpid(), "start": proc_start(os.getpid())}
+    # (the dispatcher may have granted it already: it can do that as soon as the record exists)
+    job = update_job(job_id, only_if=lambda j: (j.get("v") or 1) >= 2 and j["status"] in ("queued", "granted")
+                     and not j.get("owner"), owner=me, client_pid=os.getpid())
+    if not job:
+        say("rq supervisor of %s: not starting, the job is %s" % (job_id, (load_job(job_id) or {}).get("status")))
+        sup.release()
+        return 1
+    try:
+        sup.run()
+    except Exception as e:  # rq's own error: stop the job and wait for it, then record it failed
+        traceback.print_exc()
+        sys.stderr.flush()
+        sup.crash(e)
+    return 0
+
+
+class Supervisor:
+    """A job's owner from submission to its recorded end, detached from the session that submitted it: it holds
+    state/owners/ID.lock, which rq run took before the record existed. It waits for the job's turn, runs the job
+    with the session's environment, cwd and sandbox, its output into the job's log, and records the result.
+    Stopping the session's task never reaches it; rq cancel does (the cancel flag). SIGTERM to the supervisor
+    itself (a logout, a shutdown, a kill) stops the job too, recorded as failed: interrupted. A light job's cap,
+    and continuing a job paused in the queue on its turn, run in its main loop as well: one thread, so a cancel or
+    a stop is never crossed by a pause."""
+
+    def __init__(self, job_id, lock_fd, sig):
+        self.id, self.lock_fd, self.sig = job_id, lock_fd, sig
+        self.job = None
+        self.proc = self.caffeinate = None
+        self.cancel_seen = self.stop_seen = self.kill_at = None
+        self.noted = set()
+        self.next_note = 0
+        self.light = False  # it started as a light job: the cap applies, and it may wait paused in the queue
+        self.next_cap, self.alone_said, self.light_error = 0, False, None
+
+    def run(self):
+        if self.wait_turn():
+            self.start()
+            if self.proc:
+                self.supervise()
+
+    def wait_turn(self):
+        """Queued: wait for the turn, reading only the record, the cancel flag and the turn file."""
+        while True:
+            if self.sig["n"]:
+                self.finish("failed", reason="interrupted while queued: its rq supervisor got %s"
+                            % signal_name(self.sig["n"]))
+                return False
+            job = load_job(self.id)
+            if not job or job["status"] in TERMINAL:
+                say("not starting: the job is %s" % (job or {}).get("status", "gone"))
+                self.release()
+                return False
+            if has_flag(self.id, "cancel"):
+                self.finish("cancelled", reason="%s while queued" % (job.get("cancel_reason") or "rq cancel"))
+                return False
+            if granted(GRANT_LIGHT if job.get("kind") == "light" else GRANT) == self.id:
+                self.job = job
+                return True
+            self.note_watchers()
+            time.sleep(1)
+
+    def start(self):
+        job = self.job
+        argv = job.get("argv") or ["/bin/zsh", "-c", job["command"]]
+        # a stop or a cancel that came with the turn: the command never starts (it may clear its output at once)
+        if self.sig["n"]:
+            self.finish("failed", reason="interrupted while queued: its rq supervisor got %s"
+                        % signal_name(self.sig["n"]))
+            return
+        if has_flag(self.id, "cancel"):
+            self.finish("cancelled", reason="%s while queued" % (
+                (load_job(self.id) or job).get("cancel_reason") or "rq cancel"))
+            return
+        say("starting: %s (in %s)" % (job["command"], job["cwd"]))
+        log = os.open(os.path.join(LOGS, self.id + ".log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:  # its own process group, stdin /dev/null, output into the log, no fd of rq's (the owner lock!)
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                         start_new_session=True, close_fds=True,
+                                         env=dict(os.environ, RQ_JOB_ID=self.id))
+        except OSError as e:
+            self.finish("failed", exit=127, reason="could not start the command: %s" % (e.strerror or e))
+            return
+        finally:
+            os.close(log)
+        pid = self.proc.pid
+        self.job = update_job(self.id, status="running", started=time.time(), pid=pid,
+                              pgid=pid, job_start=proc_start(pid)) or job
+        try:
+            self.caffeinate = subprocess.Popen(["caffeinate", "-i", "-w", str(pid)], stdin=subprocess.DEVNULL,
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+        self.light = job.get("kind") == "light"
+
+    def supervise(self):
+        """Every 0.5 s: has the job ended, was it cancelled, was the supervisor told to stop, the light cap? Never a
+        blocking wait, so a signal is acted on at once (a stop or cancel that came while the job was started too)."""
+        pgid = self.proc.pid
+        while self.proc.poll() is None:
+            self.check(pgid)
+            if self.light:
+                self.light_step(pgid)
+            self.note_watchers()
+            time.sleep(0.5)
+        if self.proc.returncode == -signal.SIGTERM and not self.cancel_seen and not self.sig["n"]:
+            t0 = time.time()  # a logout or shutdown sends SIGTERM to the job and its supervisor at once
+            while not self.sig["n"] and time.time() - t0 < 1:
+                time.sleep(0.05)
+        self.note_stop(pgid, time.time())  # (the job may have died of it before the loop saw it)
+        if self.cancel_seen or self.stop_seen:  # stopped on purpose: until its whole group has ended
+            give_up = time.time() + max(CANCEL_KILL, STOP_KILL) + 15
+            while group_alive(pgid) and time.time() < give_up:
+                self.check(pgid)
+                time.sleep(0.2)
+        code, end = self.proc.returncode, time.time()
+        job = load_job(self.id) or self.job
+        reason = None
+        if self.cancel_seen:  # what it saw, not whether the flag still exists
+            status, reason = "cancelled", job.get("cancel_reason") or "rq cancel"
+        elif code == 0:
+            status = "done"
+        else:
+            status = "failed"
+            if self.stop_seen:
+                reason = "interrupted: its rq supervisor got %s" % signal_name(self.stop_seen[1])
+        self.finish(status, exit=code, finished=end, ran=lambda j: run_time(j, end), reason=reason)
+
+    def check(self, pgid):
+        now = time.time()
+        if not self.cancel_seen and has_flag(self.id, "cancel"):
+            self.cancel_seen = now
+            say("cancelled (%s): stopping the job" % ((load_job(self.id) or {}).get("cancel_reason") or "rq cancel"))
+            self.send(pgid, signal.SIGCONT, signal.SIGTERM)
+            self.kill_at = min(self.kill_at or now + CANCEL_KILL, now + CANCEL_KILL)
+        self.note_stop(pgid, now)
+        if self.kill_at and now >= self.kill_at:
+            self.kill_at = None
+            if group_alive(pgid):
+                say("the job still runs after it was stopped: SIGKILL")
+                self.send(pgid, signal.SIGKILL)
+
+    def note_stop(self, pgid, now):
+        """The supervisor got SIGTERM, SIGINT or SIGHUP: stop the job (SIGKILL after STOP_KILL)."""
+        if not self.stop_seen and self.sig["n"]:
+            self.stop_seen = (now, self.sig["n"])
+            say("its rq supervisor got %s (a logout, a shutdown or a kill): stopping the job"
+                % signal_name(self.sig["n"]))
+            self.send(pgid, signal.SIGCONT, signal.SIGTERM)
+            self.kill_at = min(self.kill_at or now + STOP_KILL, now + STOP_KILL)
+
+    def light_step(self, pgid):
+        """A light job: past LIGHT_CAP of running time (rq pause time left out) while other work is active, pause it
+        and move it into the main queue as a heavy job; alone, or with rq keep ID or rq pause ID, it runs on. Paused
+        in the queue (after the cap, or rq move ID queue), continue it once the dispatcher grants it the main turn.
+        An error (a full disk, say) is logged and the step tried again; it never leaves the job stopped by itself."""
+        if self.cancel_seen or self.stop_seen or self.sig["n"]:
+            return  # (it is being stopped)
+        try:
+            job = load_job(self.id)
+            if not job or job["status"] in TERMINAL or has_flag(self.id, "cancel"):
+                return
+            if job["status"] in ("queued", "granted"):  # paused in the queue
+                if granted(GRANT) == self.id:
+                    self.continue_turn(pgid)
+                return
+            now = time.time()
+            if job["status"] != "running" or job.get("kind") != "light" or now < self.next_cap:
+                return
+            self.next_cap = now + 2
+            if has_flag(self.id, "keep") or has_flag(self.id, "paused") or (run_time(job, now) or 0) < LIGHT_CAP:
+                return
+            if not other_work(self.id):
+                if not self.alone_said:
+                    say("running longer than %s as light work, but nothing else is waiting: it runs on"
+                        % fmt_duration(LIGHT_CAP))
+                    self.alone_said = True
+                return
+            self.cap(pgid)
+            self.light_error = None
+        except Exception as e:
+            if repr(e) != self.light_error:
+                self.light_error = repr(e)
+                say("the light cap failed (%s); trying again" % e)
+
+    def cap(self, pgid):
+        """Pause the job and move it into the queue, under the jobs lock (rq move ID queue and rq pause take it
+        too), and only if it is still a running light job that nothing exempts or stops. If the move can't be
+        written, the job runs on."""
+        now = time.time()
+        with jobs_lock():
+            job = load_job(self.id)
+            if not job or job["status"] != "running" or job.get("kind") != "light" or self.proc.poll() is not None \
+                    or self.sig["n"] or any(has_flag(self.id, k) for k in ("keep", "paused", "cancel")):
+                return
+            if not signal_group(pgid, signal.SIGSTOP):
+                return
+            moved = None
+            try:
+                moved = update_job(self.id, kind="heavy", status="queued", promoted=now, submitted=now,
+                                   stopped=lambda j: open_stop(j, now))
+            finally:
+                if not moved:
+                    self.send(pgid, signal.SIGCONT)
+        if moved:
+            say("ran longer than %s as light work while other work is waiting: paused and moved into the queue, "
+                "continuing when it's its turn" % fmt_duration(LIGHT_CAP))
+
+    def continue_turn(self, pgid):
+        """Its turn, paused in the queue: running again, its stop closed, SIGCONT. One that rq pause paused as
+        well stays paused, with its turn, until rq resume ID."""
+        now = time.time()
+        paused = has_flag(self.id, "paused")
+        new = update_job(self.id, only_if=lambda j: j["status"] in ("queued", "granted"), status="running",
+                         resumed=now, **({} if paused else {"stopped": lambda j: close_stop(j, now)}))
+        if not new:
+            return
+        if paused:
+            say("its turn: it stays paused (rq pause), %s continues it" % rq_cmd("resume", self.id))
+            return
+        self.send(pgid, signal.SIGCONT)
+        say("its turn: continuing")
+
+    def send(self, pgid, *sigs):
+        try:
+            signal_group(pgid, *sigs)
+        except OSError as e:
+            say("could not signal the job's processes (group %s): %s" % (pgid, e.strerror or e))
+
+    def finish(self, status, **fields):
+        """The one terminal write (the lock says this supervisor owns the job, whatever its record says), then the
+        result line into the log and into the output files of tasks that stopped watching, the flags cleared, and
+        the owner lock given up last. watched_at_end: how many tasks of the session that queued it watch it now."""
+        changes = {"status": status, "finished": time.time(),
+                   "watched_at_end": len(own_watchers(load_job(self.id) or {"id": self.id, "v": 2}))}
+        changes.update((k, v) for k, v in fields.items() if v is not None)
+        job = update_job(self.id, **changes) or {"id": self.id, "status": status}
+        text = result_line(job)
+        say(text)
+        self.note_watchers(final=text)
+        clear_flags(self.id)
+        if self.caffeinate:
+            try:
+                self.caffeinate.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.caffeinate.kill()
+                self.caffeinate.wait()
+        self.release()
+
+    def release(self):
+        try:
+            os.remove(owner_lock(self.id))
+        except OSError:
+            pass
+        try:
+            os.close(self.lock_fd)
+        except OSError:
+            pass
+
+    def note_watchers(self, final=None):
+        """Notes in the output files of tasks that stopped watching (killed, or their session gone): at once that
+        the job carries on, at the end its result. A session that comes back may read that file again. Best effort:
+        an error here never reaches the job."""
+        if final is None and time.time() < self.next_note:
+            return
+        self.next_note = time.time() + 5
+        try:
+            self._note_watchers(final)
+        except Exception as e:
+            say("could not note the result for stopped watchers: %r" % e)
+
+    def _note_watchers(self, final):
+        for path in watch_files(self.id):
+            if lock_held(path):
+                continue  # a live watcher: it sees everything itself
+            out = (read_json(path, {}) or {}).get("task_output")
+            if final is not None:
+                if final not in file_tail(out):  # (its stop handler may have shown the result already)
+                    append_note(out, "%s (it ended after this task had stopped watching it)" % final)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            elif path not in self.noted:
+                self.noted.add(path)
+                if "stopped watching %s;" % self.id not in file_tail(out):
+                    job = load_job(self.id) or {}
+                    append_note(out, "job %s %s: this task stopped watching it, which does not cancel it (%s to "
+                                     "watch it again, %s to stop it)" % (
+                                         self.id, "is still queued" if job.get("status") == "queued"
+                                         and not job.get("started") else "keeps running",
+                                         rq_cmd("wait", self.id), rq_cmd("cancel", self.id)))
+
+    def crash(self, error):
+        """rq itself failed: stop the job's processes and wait for them, then record failed (never a result while
+        the job still runs)."""
+        proc = self.proc
+        if proc and proc.poll() is None:
+            self.send(proc.pid, signal.SIGCONT, signal.SIGTERM)
+            t0 = time.time()
+            while proc.poll() is None and time.time() - t0 < STOP_KILL:
+                time.sleep(0.2)
+            if proc.poll() is None:
+                self.send(proc.pid, signal.SIGKILL)
+                proc.wait()
+        end = time.time()
+        self.finish("failed", exit=proc.returncode if proc else None, finished=end,
+                    ran=(lambda j: run_time(j, end)) if proc else None,
+                    reason="rq's supervisor failed: %s (see rq log %s)" % (type(error).__name__, self.id))
 
 
 def other_work(job_id):
-    """Work a long light job would hold up or compete with: a heavy job running or queued, or a light job waiting."""
-    q = dispatcher_state().get("queue")
-    if q is not None:  # the dispatcher's published queue: no need to read every record
-        return bool(q.get("running") or [i for i in q.get("main", []) if i != job_id]
-                    or [i for i in q.get("light", []) if i != job_id])
+    """Work a long light job would hold up or compete with: a heavy job running or queued, or a light job waiting.
+    From the queue the dispatcher publishes (it leaves out queued jobs being cancelled or whose processes it is
+    stopping, and closes those whose owner is gone); with no dispatcher, from the records, where a queued job that
+    was cancelled or whose owner is gone doesn't count: nobody waits for it."""
+    d = dispatcher_state()
+    q = d.get("queue")
+    if d["alive"] and isinstance(q, dict):
+        others = [i for i in (q.get("main") or []) + (q.get("light") or []) if i != job_id]
+        return {"id": others[0]} if others else {"id": None, "running": q["running"]} if q.get("running") else None
     for job in all_jobs():
-        if job["id"] == job_id:
+        if job["id"] == job_id or job["status"] not in ("queued", "granted", "running"):
             continue
-        if job.get("kind") == "light" and job["status"] == "queued":
-            return job
-        if job.get("kind") != "light" and job["status"] in ("queued", "granted", "running"):
+        if job["status"] == "queued" and (has_flag(job["id"], "cancel") or not owner_alive(job)):
+            continue
+        if job.get("kind") != "light" or job["status"] == "queued":
             return job
     return None
-
-
-def cap_light(job_id, proc):
-    """A light job that runs longer than LIGHT_CAP while other work is active (a heavy job, or a light job waiting)
-    is paused and queued as a heavy job; it continues, with its progress, when it's its turn. Alone, it runs on.
-    `rq keep ID` lets it run on in any case."""
-    place_cache = {}
-    alone_said = False
-    while proc.poll() is None:
-        time.sleep(2)
-        job = load_job(job_id) or {}
-        if has_flag(job_id, "keep") or has_flag(job_id, "cancel"):
-            return
-        if time.time() - job.get("started", time.time()) < LIGHT_CAP:
-            continue
-        if not other_work(job_id):
-            if not alone_said:
-                say("running longer than %s as light work, but nothing else is waiting: it runs on"
-                    % fmt_duration(LIGHT_CAP))
-                alone_said = True
-            continue
-        try:
-            os.killpg(proc.pid, signal.SIGSTOP)
-        except ProcessLookupError:
-            return
-        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(), stopped=open_stop(job))
-        save_job(job)
-        say("ran longer than %s as light work while other work is waiting: paused and moved into the queue, "
-            "continuing when it's its turn" % fmt_duration(LIGHT_CAP))
-        last = None
-        while proc.poll() is None:
-            if has_flag(job_id, "cancel"):
-                return  # cmd_cancel continues and stops the processes
-            if granted() == job_id:
-                job = load_job(job_id) or job
-                job.update(status="running", resumed=time.time(), stopped=close_stop(job))
-                save_job(job)
-                os.killpg(proc.pid, signal.SIGCONT)
-                say("its turn: continuing")
-                return
-            position, _, _ = queue_place(job_id, False, place_cache)
-            if position != last:
-                say("paused, waiting in the queue" + (", position %s" % position if position else ""))
-                last = position
-            time.sleep(TICK)
-        return
 
 
 # ---------- control ----------
 
 def find_job(prefix):
-    jobs = [j for j in all_jobs() if j["id"] == prefix] or [j for j in all_jobs() if prefix in j["id"]]
+    """A job by its id, or by any part of it that matches only one job (one read of the records at most)."""
+    if re.match(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*$", prefix or ""):
+        job = load_job(prefix)
+        if job and job.get("id") == prefix:
+            return job
+    jobs = [j for j in all_jobs() if prefix in j["id"]]
     if len(jobs) != 1:
         sys.exit("rq: %s matches %d jobs" % (prefix, len(jobs)))
     return jobs[0]
@@ -1432,21 +3308,30 @@ def cmd_cancel(args):
     job = find_job(args.id)
     if job["status"] in TERMINAL:
         sys.exit("rq: %s is already %s" % (job["id"], job["status"]))
-    set_flag(job["id"], "cancel")
-    if job.get("pgid") and group_alive(job["pgid"]):
-        os.killpg(job["pgid"], signal.SIGCONT)
-        os.killpg(job["pgid"], signal.SIGTERM)
+    err = cancel_job(job, "rq cancel")
+    if err:
+        sys.exit("rq: %s is marked cancelled, but its processes (group %s) could not be signalled from here: %s"
+                 % (job["id"], job.get("pgid"), err.strerror or err))
     print("rq: cancelling %s" % job["id"])
 
 
 def cmd_pause(args, pause=True):
+    """rq pause / rq resume: SIGSTOP or SIGCONT to a running job's processes (only while they are still its own,
+    see job_group), its paused flag and its stopped intervals, under the jobs lock (the light cap takes it too)."""
     job = find_job(args.id)
-    if job["status"] != "running" or not group_alive(job.get("pgid")):
-        sys.exit("rq: %s isn't running" % job["id"])
-    os.killpg(job["pgid"], signal.SIGSTOP if pause else signal.SIGCONT)
-    set_flag(job["id"], "paused", pause)
-    job["stopped"] = open_stop(job) if pause else close_stop(job)
-    save_job(job)
+    with jobs_lock():
+        job = load_job(job["id"]) or job
+        group = job_group(job) if job["status"] == "running" else None
+        if not group:
+            sys.exit("rq: %s isn't running" % job["id"])
+        try:
+            sent = signal_group(group, signal.SIGSTOP if pause else signal.SIGCONT)
+        except PermissionError as e:
+            sys.exit("rq: could not %s %s: %s" % ("pause" if pause else "resume", job["id"], e.strerror or e))
+        if not sent:
+            sys.exit("rq: %s isn't running" % job["id"])
+        set_flag(job["id"], "paused", pause)
+        update_job(job["id"], stopped=open_stop if pause else close_stop)
     print("rq: %s %s (it keeps its turn)" % ("paused" if pause else "resumed", job["id"]))
 
 
@@ -1457,8 +3342,8 @@ def cmd_estimate(args):
     seconds = parse_duration(args.duration)
     if not seconds:
         sys.exit("rq: %r isn't a duration (e.g. 45m, 2h30m)" % args.duration)
-    job["estimate"] = seconds
-    save_job(job)
+    if not update_job(job["id"], only_if=lambda j: j["status"] not in TERMINAL, estimate=seconds):
+        sys.exit("rq: %s has just ended" % job["id"])
     print("rq: %s is expected to take %s" % (job["id"], fmt_duration(seconds)))
 
 
@@ -1473,13 +3358,34 @@ def cmd_keep(args):
 def cmd_move(args):
     job = find_job(args.id)
     if args.where == "queue":  # a running light job, paused and moved to the end of the main queue
-        if job.get("kind") != "light" or job["status"] != "running" or not group_alive(job.get("pgid")):
-            sys.exit("rq: %s isn't a running light job" % job["id"])
-        set_flag(job["id"], "keep")  # its own client must not move it again
-        os.killpg(job["pgid"], signal.SIGSTOP)
-        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(), stopped=open_stop(job),
-                   resume_by_dispatcher=True)
-        save_job(job)
+        with jobs_lock():  # (the light cap moves it under this lock too: one of them does, never both)
+            job = load_job(job["id"]) or job
+            group = job_group(job) if job.get("kind") == "light" and job["status"] == "running" else None
+            if not group:
+                sys.exit("rq: %s isn't a running light job" % job["id"])
+            v1 = (job.get("v") or 1) < 2
+            set_flag(job["id"], "keep")  # its owner must not move it again (an older client's light cap)
+            try:
+                sent = signal_group(group, signal.SIGSTOP)
+            except PermissionError as e:
+                set_flag(job["id"], "keep", False)
+                sys.exit("rq: could not pause %s: %s" % (job["id"], e.strerror or e))
+            if not sent:
+                set_flag(job["id"], "keep", False)
+                sys.exit("rq: %s isn't running" % job["id"])
+            now = time.time()
+            moved = None
+            try:  # a v2 job's supervisor continues it on its turn; an older client's job, the dispatcher
+                moved = update_job(job["id"], only_if=lambda j: j["status"] == "running" and j.get("kind") == "light",
+                                   kind="heavy", status="queued", promoted=now, submitted=now,
+                                   stopped=lambda j: open_stop(j, now),
+                                   **({"resume_by_dispatcher": True} if v1 else {}))
+            finally:
+                if not moved and not has_flag(job["id"], "paused"):
+                    signal_group(group, signal.SIGCONT)  # not moved: it runs on
+            if not moved:
+                current = load_job(job["id"]) or {}
+                sys.exit("rq: %s changed meanwhile (%s); not moved" % (job["id"], current.get("status")))
         print("rq: paused %s and moved it to the end of the main queue; it continues when it's its turn" % job["id"])
         return
     if job["status"] != "queued":
@@ -1511,30 +3417,50 @@ def cmd_status(args):
     g = d.get("gpu") or {}
     if g.get("util") is not None:
         print("gpu: %d%% of %s GPU cores (average over 10 s)" % (g["util"], g.get("cores") or "?"))
+    def seen(j):  # who sees a job: nobody watches it, its session ended, its owner is gone, nobody saw its result
+        marks = []
+        if j.get("owner_alive") is False:
+            marks.append("its rq supervisor is gone")
+        if j.get("unwatched"):
+            marks.append("unwatched")
+        if j.get("unseen"):
+            marks.append("unseen")
+        if j.get("session_ended"):
+            marks.append("session ended")
+        return "  " + ", ".join(marks) if marks else ""
     r = snap["running"]
     if r:
-        print("\nrunning:  %s  %s/%s  %s elapsed, expected %s, done ~%s%s" % (
+        print("\nrunning:  %s  %s/%s  %s elapsed, expected %s, done ~%s%s%s" % (
             r["id"], r["project"], r["name"], fmt_duration(r["elapsed"]), fmt_duration(r["expected"]),
-            fmt_time(r["eta"]), "  PAUSED" if r["paused"] else ""))
+            fmt_time(r["eta"]), "  PAUSED" if r["paused"] else "", seen(r)))
     for j in snap["light"]:
-        print("\nlight:    %s  %s/%s  %s elapsed" % (j["id"], j["project"], j["name"], fmt_duration(j["elapsed"])))
+        print("\nlight:    %s  %s/%s  %s elapsed%s" % (j["id"], j["project"], j["name"], fmt_duration(j["elapsed"]),
+                                                     seen(j)))
     if snap["light_queued"]:
         print("\nlight queue:")
         for i, j in enumerate(snap["light_queued"], 1):
-            print("  %d. %s  %s/%s" % (i, j["id"], j["project"], j["name"]))
+            print("  %d. %s  %s/%s%s" % (i, j["id"], j["project"], j["name"], seen(j)))
     if snap["queued"]:
         print("\nqueued:")
         for i, j in enumerate(snap["queued"], 1):
-            print("  %d. %s  %s/%s  expected %s, start ~%s, done ~%s" % (
+            print("  %d. %s  %s/%s  expected %s, start ~%s, done ~%s%s" % (
                 i, j["id"], j["project"], j["name"], fmt_duration(j["expected"]), fmt_time(j["eta_start"]),
-                fmt_time(j["eta"])))
+                fmt_time(j["eta"]), seen(j)))
     for w in d.get("warnings", []):
         print("\noutside the queue: %s" % describe([w]))
     if snap["finished"]:
         print("\nrecent:")
         for j in snap["finished"][:8]:
-            took = fmt_duration(j["finished"] - j["started"]) if j.get("started") and j.get("finished") else "-"
-            print("  %s  %-9s %s/%s  %s" % (fmt_time(j.get("finished")), j["status"], j["project"], j["name"], took))
+            took = fmt_duration(j["took"]) if j.get("took") is not None else "-"  # running time, without pauses
+            print("  %s  %-9s %s/%s  %s%s%s" % (fmt_time(j.get("finished")), j["status"], j["project"], j["name"], took,
+                                             "  (%s)" % j["reason"] if j.get("reason") else "", seen(j)))
+    if snap["unseen"]:
+        print("\nunseen: they ended while no task watched them, and no session has their result yet (the session "
+              "that queued one gets it with %s):" % rq_cmd("wait", "ID"))
+        for j in snap["unseen"]:
+            print("  %s  %s  %s/%s  %s%s" % (fmt_time(j.get("finished")), j["id"], j["project"], j["name"],
+                                            j["status"] + ("" if j.get("exit") is None else " %d" % j["exit"]),
+                                            "  session ended" if j.get("session_ended") else ""))
 
 
 # ---------- status page ----------
@@ -1575,9 +3501,9 @@ class Page(BaseHTTPRequestHandler):
         return origin in ("http://localhost:%d" % port, "http://127.0.0.1:%d" % port, "http://[::1]:%d" % port)
 
     def target(self, rest):
-        """<job>/<key>[/<frame>] to the artifact's file, or None."""
+        """<job>/<key>[/<frame>] to the declared output's file (or folder), or None."""
         parts = rest.split("/")
-        if len(parts) not in (2, 3) or (len(parts) == 3 and not parts[2].isdigit()):
+        if len(parts) not in (2, 3) or (len(parts) == 3 and not re.match(r"^[0-9]{1,%d}$" % FRAME_DIGITS, parts[2])):
             return None
         return artifact_target(parts[0], parts[1], int(parts[2]) if len(parts) == 3 else None)
 
@@ -1598,7 +3524,7 @@ class Page(BaseHTTPRequestHandler):
             job = load_job(m.group(1))
             if not job:
                 return self.send("not found", "text/plain", 404)
-            return self.send(json.dumps(job_artifacts(job)), "application/json")
+            return self.send(json.dumps(job_sheet(job)), "application/json")
         if path.startswith("/api/file/"):
             target = self.target(path[len("/api/file/"):])
             if not target or os.path.isdir(target):
@@ -1607,8 +3533,9 @@ class Page(BaseHTTPRequestHandler):
         self.send("not found", "text/plain", 404)
 
     def do_POST(self):
-        """/api/open/<job>/<key>[/<frame>]: open an artifact on this machine with its usual app;
-        /api/reveal/...: show it in the Finder. For a whole sequence: its folder."""
+        """/api/open/<job>/<key>[/<frame>]: open a job's output on this machine with its usual app;
+        /api/reveal/...: show it in the Finder. For a whole sequence or a declared folder: the folder (a package
+        such as Tool.app only shown in the Finder, never launched)."""
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(min(length, 65536))
@@ -1618,7 +3545,7 @@ class Page(BaseHTTPRequestHandler):
         target = self.target(m.group(2)) if m else None
         if not target:
             return self.send("not found", "text/plain", 404)
-        argv = ["open", target] if m.group(1) == "open" else ["open", "-R", target]
+        argv = ["open", target] if m.group(1) == "open" and not is_package(target) else ["open", "-R", target]
         if os.environ.get("RQ_DRY_OPEN"):  # tests: say what would run
             return self.send(json.dumps({"would_run": argv}), "application/json")
         subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1674,14 +3601,37 @@ class Page(BaseHTTPRequestHandler):
 
 def main():
     p = argparse.ArgumentParser(prog="rq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
-    for name, text in (("run", "queue a heavy job, run it when it's its turn, stream its output"),
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    for name, text in (("run", "queue a heavy job; its own rq supervisor runs it on its turn; watch its output"),
                        ("light", "queue a light job: one at a time, at low priority, next to the main queue")):
         r = sub.add_parser(name, help=text, description=text)
         r.add_argument("--name", required=True)
-        r.add_argument("--project", help="default: from the current folder")
+        r.add_argument("--project", help="the project's folder name in the projects folder (default: from the "
+                                         "current folder)")
         r.add_argument("--estimate", help="e.g. 90m, 2h30m, 45s")
+        r.add_argument("--detach", action="store_true",
+                       help="submit only, don't watch it (rq wait ID watches it later)")
+        r.add_argument("--output", "-o", action="append", dest="outputs", metavar="PATH",
+                       help="a picture or video file, a folder (ending in /) or a frame pattern (renders/####.png, "
+                            "%%04d, %%d, with the job's zero padding) the job writes, in the project; repeat it for "
+                            "several. Every job needs --output or --no-output")
+        r.add_argument("--no-output", action="store_true", help="the job writes no pictures or videos")
+        again = r.add_mutually_exclusive_group()
+        again.add_argument("--again", action="store_true",
+                           help="queue it even if the same job is still queued or running and no task watches it")
+        again.add_argument("--replace", action="store_true",
+                           help="first cancel this project's jobs with this name that are still queued or running")
         r.add_argument("command", nargs=argparse.REMAINDER)
+    w = sub.add_parser("wait", help="watch a job again: its output from here, then its exit code (never cancels)")
+    w.add_argument("id")
+    w.add_argument("-n", type=int, default=20, help="log lines to show first (default 20)")
+    mine = sub.add_parser("mine", help="this session's jobs that no task of it watches, and results that didn't "
+                                       "reach it")
+    mine.add_argument("--unwatched", action="store_true", help="leave out jobs that a task of this session watches")
+    mine.add_argument("--hook", action="store_true", help="run as a Claude Code hook: its JSON on stdin")
+    sup = sub.add_parser("_supervise")  # started by rq run, detached: the job's owner
+    sup.add_argument("id")
+    sup.add_argument("--lock-fd", type=int, required=True)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     for name in ("cancel", "pause", "resume", "keep"):
@@ -1699,9 +3649,15 @@ def main():
     for name in ("daemon", "start"):
         sub.add_parser(name).add_argument("--port", type=int, default=PORT)
     args = p.parse_args()
-    setup()
+    try:
+        setup()
+    except OSError:
+        if args.cmd != "mine":  # a hook must never fail
+            raise
     if args.cmd in ("run", "light"):
         sys.exit(cmd_run(args))
+    if args.cmd in ("wait", "mine", "_supervise"):
+        sys.exit({"wait": cmd_wait, "mine": cmd_mine, "_supervise": cmd_supervise}[args.cmd](args))
     {"status": cmd_status, "cancel": cmd_cancel, "pause": cmd_pause,
      "resume": lambda a: cmd_pause(a, False), "move": cmd_move, "keep": cmd_keep, "estimate": cmd_estimate, "log": cmd_log, "daemon": cmd_daemon,
      "start": cmd_start}[args.cmd](args)
