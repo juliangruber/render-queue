@@ -22,13 +22,19 @@ whose turn it is and serves the status page.
 A single COMMAND argument runs through /bin/zsh -c, several run as argv.
 """
 import argparse
+import bisect
 import fcntl
+import glob
+import hashlib
 import html
 import json
+import mimetypes
 import os
 import random
 import re
 import signal
+import socket
+import stat
 import statistics
 import string
 import subprocess
@@ -42,6 +48,7 @@ STATE = os.environ.get("RQ_STATE", os.path.join(HOME, "state"))
 JOBS = os.path.join(STATE, "jobs")
 LOGS = os.path.join(STATE, "logs")
 FLAGS = os.path.join(STATE, "flags")
+ARTIFACTS = os.path.join(STATE, "artifacts")  # per job: the pictures and videos it produced
 GRANT = os.path.join(STATE, "grant")
 GRANT_LIGHT = os.path.join(STATE, "grant-light")  # the light queue's turn: one light job at a time
 ORDER = os.path.join(STATE, "order.json")
@@ -61,7 +68,7 @@ TERMINAL = ("done", "failed", "cancelled", "lost")
 # ---------- files ----------
 
 def setup():
-    for d in (JOBS, LOGS, FLAGS):
+    for d in (JOBS, LOGS, FLAGS, ARTIFACTS):
         os.makedirs(d, exist_ok=True)
 
 
@@ -74,7 +81,7 @@ def read_json(path, default=None):
 
 
 def write_json(path, data):
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
     os.replace(tmp, path)
@@ -636,6 +643,391 @@ def session_states():
     return states
 
 
+# ---------- artifacts: the pictures and videos a finished job produced ----------
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff", ".heic", ".exr"}
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
+NO_BROWSER_EXT = {".exr"}  # no browser shows these: the page offers to open them on the Mac instead
+SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".cache", ".mypy_cache", ".pytest_cache"}
+SCRATCH_GLOB = os.environ.get("RQ_SCRATCH_GLOB", "/private/tmp/claude-%d/" % os.getuid())  # this user's scratchpads
+ARTIFACT_GRACE = 5  # seconds after a job ends that its files may still land
+ARTIFACT_SETTLE = 8  # seconds to wait after a job ends before looking for its files
+ARTIFACT_DAYS = 2  # how far back the dispatcher looks for jobs without artifacts (older ones: when opened)
+MAX_SINGLES = 500  # single pictures and videos kept per job; sequences are always kept
+SEQUENCE_MIN = 24  # numbered pictures in one folder that make a sequence (animation frames, not a few stills)
+_SEQ = re.compile(r"^(.*?)(\d+)(\.[A-Za-z0-9]+)$")
+for _type, _ext in (("video/quicktime", ".mov"), ("video/mp4", ".m4v"), ("video/webm", ".webm"),
+                    ("video/x-matroska", ".mkv"), ("image/webp", ".webp"), ("image/avif", ".avif"),
+                    ("image/heic", ".heic"), ("image/x-exr", ".exr")):
+    mimetypes.add_type(_type, _ext)
+
+
+def open_stop(job, now=None):
+    """The job's stopped intervals with a new one starting now (paused in the queue, or rq pause)."""
+    stops = [list(x) for x in job.get("stopped") or []]
+    if not stops or stops[-1][1] is not None:
+        stops.append([now or time.time(), None])
+    return stops
+
+
+def close_stop(job, now=None):
+    stops = [list(x) for x in job.get("stopped") or []]
+    if stops and stops[-1][1] is None:
+        stops[-1][1] = now or time.time()
+    return stops
+
+
+def project_dirs(project):
+    """A project's folder and this user's Claude Code scratchpad folders of it (also of sessions in its subfolders)."""
+    dirs = [os.path.realpath(os.path.join(ROOT, project))]
+    for d in glob.glob(SCRATCH_GLOB + ROOT_DASHED + "-" + dashed(project) + "*"):
+        try:
+            if os.path.isdir(d) and os.stat(d).st_uid == os.getuid() and project_of(d + "/") == project:
+                dirs.append(os.path.realpath(d))
+        except OSError:
+            continue
+    return dirs
+
+
+def inside(path, tops):
+    return any(path == t or path.startswith(t.rstrip("/") + "/") for t in tops)
+
+
+def media_files(project):
+    """{real path: (mtime, size)} of every picture and video file in a project's folders. Folders reached through a
+    symlink are not followed (snapshots link back into the project); a symlinked file counts only if it leads to a
+    regular picture or video file inside the project's own folders. The queue's own folder is skipped."""
+    tops = project_dirs(project)
+    found = {}
+    for top in tops:
+        stack = [top]
+        while stack:
+            folder = stack.pop()
+            if folder == HOME:
+                continue
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for e in entries:
+                if e.name in SKIP_DIRS:
+                    continue
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                        continue
+                    if os.path.splitext(e.name)[1].lower() not in MEDIA_EXT:
+                        continue
+                    if e.is_symlink():
+                        path = os.path.realpath(e.path)
+                        if os.path.splitext(path)[1].lower() not in MEDIA_EXT or not inside(path, tops):
+                            continue
+                        st = os.stat(path)
+                    else:
+                        path, st = e.path, e.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode) or path in found:
+                        continue
+                    found[path] = (st.st_mtime, st.st_size)
+                except OSError:
+                    continue
+    return found
+
+
+def job_end(job, now):
+    """When a job stopped producing files: its end, or for a lost job the last write to its log (the dispatcher
+    may notice a dead client long after it died)."""
+    if job["status"] not in TERMINAL:
+        return now
+    end = job.get("finished") or now
+    if job["status"] == "lost":
+        try:
+            end = min(end, max(job["started"], os.path.getmtime(os.path.join(LOGS, job["id"] + ".log"))))
+        except OSError:
+            pass
+    return end
+
+
+def job_runs(job, now=None):
+    """The intervals in which a job was really running (without the time it was stopped), or [] if it never ran."""
+    if not job.get("started"):
+        return []
+    now = now or time.time()
+    end = job_end(job, now)
+    stops = [list(x) for x in job.get("stopped") or []]
+    if not stops and job.get("promoted"):  # records from before stops were kept
+        stops = [[job["promoted"], job.get("resumed")]]
+    runs, t = [], job["started"]
+    for a, b in sorted(stops, key=lambda x: x[0]):
+        b = end if b is None else b
+        if a > t:
+            runs.append((t, min(a, end)))
+        t = max(t, b)
+    if t < end:
+        runs.append((t, end))
+    return [r for r in runs if r[1] >= r[0]] or [(job["started"], job["started"])]
+
+
+def peer(job, base, now):
+    """A job prepared for attribution: its running intervals, the same with a little slack, its working folder."""
+    runs = job_runs(job, now)
+    if not runs:
+        return None
+    cwd = os.path.realpath(job.get("cwd") or "/").rstrip("/")
+    return dict(job, _runs=runs, _slack=[(runs[0][0] - 1, runs[-1][1] + ARTIFACT_GRACE)],
+                _span=(runs[0][0] - 1, runs[-1][1] + ARTIFACT_GRACE), _active=sum(b - a for a, b in runs),
+                _cwd=None if cwd in (base, ROOT, "") else cwd)
+
+
+def owner_of(path, mtime, candidates):
+    """Of the jobs that could have written a file: the ones really running at its mtime (else those within the
+    slack), then the one running in the file's folder (deepest working folder), then the shortest."""
+    live = [j for j in candidates if any(a <= mtime <= b for a, b in j["_runs"])]
+    pool = live or [j for j in candidates if any(a <= mtime <= b for a, b in j["_slack"])]
+    if not pool:
+        return None
+    shortest = lambda j: (j["_active"], j["id"])
+    in_folder = [j for j in pool if j["_cwd"] and (path + "/").startswith(j["_cwd"] + "/")]
+    if in_folder:
+        depth = max(len(j["_cwd"]) for j in in_folder)
+        return min((j for j in in_folder if len(j["_cwd"]) == depth), key=shortest)
+    return min(pool, key=shortest)
+
+
+def sequence_key(path):
+    """(folder, prefix, extension, number, digits) of a numbered picture, else None."""
+    ext = os.path.splitext(path)[1].lower()
+    m = _SEQ.match(os.path.basename(path))
+    if not m or ext not in IMAGE_EXT:
+        return None
+    return os.path.dirname(path), m.group(1), m.group(3), int(m.group(2)), m.group(2)
+
+
+def item_key(*parts):
+    """A short stable id for an artifact (its URL keeps working when the list is rebuilt)."""
+    return hashlib.sha1("\0".join(str(p) for p in parts).encode()).hexdigest()[:12]
+
+
+def frame_width(frames):
+    """The zero padding of a sequence's numbers (0: none), or None if they mix padded and unpadded numbering."""
+    digits = [d for _, d, _, _, _ in frames]
+    width = min(len(d) for d in digits)
+    if all(d == "%0*d" % (width, n) for n, d, _, _, _ in frames):
+        return width if len({len(d) for d in digits}) == 1 or any(d.startswith("0") for d in digits) else 0
+    return None
+
+
+def group_media(files):
+    """Pictures and videos as items. Numbered pictures in one folder (padded or not) become a sequence, with its
+    frames as ranges; numbered videos stay single videos."""
+    groups, singles = {}, []
+    for path, (mtime, size) in files.items():
+        k = sequence_key(path)
+        if k:
+            groups.setdefault(k[:3], []).append((k[3], k[4], path, mtime, size))
+        else:
+            singles.append((path, mtime, size))
+    items = []
+    for (folder, prefix, ext), frames in groups.items():
+        width = frame_width(frames)
+        if len(frames) < SEQUENCE_MIN or width is None:
+            singles += [(p, mt, sz) for _, _, p, mt, sz in frames]  # a few stills, or mixed numbering
+            continue
+        numbers = sorted({n for n, _, _, _, _ in frames})
+        ranges = []
+        for n in numbers:
+            if ranges and n == ranges[-1][1] + 1:
+                ranges[-1][1] = n
+            else:
+                ranges.append([n, n])
+        items.append({"kind": "sequence", "key": item_key(folder, prefix, ext), "media": "image", "dir": folder,
+                      "prefix": prefix, "width": width, "ext": ext, "frames": ranges, "count": len(numbers),
+                      "size": sum(sz for _, _, _, _, sz in frames), "mtime": max(mt for _, _, _, mt, _ in frames)})
+    singles.sort(key=lambda f: -f[1])
+    for path, mtime, size in singles:
+        ext = os.path.splitext(path)[1].lower()
+        items.append({"kind": "video" if ext in VIDEO_EXT else "image", "key": item_key(path), "path": path,
+                      "size": size, "mtime": mtime})
+    order = {"video": 0, "image": 1, "sequence": 2}
+    items.sort(key=lambda i: (order[i["kind"]], -i["mtime"]))
+    kept, truncated, n_singles = [], 0, 0
+    for item in items:
+        if item["kind"] != "sequence":
+            n_singles += 1
+            if n_singles > MAX_SINGLES:
+                truncated += 1
+                continue
+        kept.append(item)
+    return kept, truncated
+
+
+def save_artifacts(job, items, truncated, now):
+    write_json(os.path.join(ARTIFACTS, job["id"] + ".json"), {"at": now, "items": items, "truncated": truncated})
+    kinds = {}
+    for item in items:
+        kinds[item["kind"]] = kinds.get(item["kind"], 0) + 1
+    fresh = load_job(job["id"]) or job  # keep anything its client wrote meanwhile
+    fresh["artifacts"] = {"at": now, "count": len(items) + truncated, "kinds": kinds}
+    save_job(fresh)
+    job.update(fresh)
+
+
+def index_artifacts(targets, jobs):
+    """Find and save the artifacts of finished jobs, with one scan per project. Every file goes to the job that
+    wrote it (owner_of); a frame sequence goes as a whole to the job that wrote most of its frames."""
+    now = time.time()
+    by_project = {}
+    for job in targets:
+        if job["project"] == SELF or not job.get("started"):
+            save_artifacts(job, [], 0, now)  # nothing to look for
+        else:
+            by_project.setdefault(job["project"], []).append(job)
+    for project, mine in by_project.items():
+        base = os.path.realpath(os.path.join(ROOT, project))
+        files = sorted((mtime, path, size) for path, (mtime, size) in media_files(project).items())
+        times = [f[0] for f in files]
+        peers = sorted((p for p in (peer(j, base, now) for j in jobs if j["project"] == project) if p),
+                       key=lambda p: p["_span"][0])
+        starts = [p["_span"][0] for p in peers]
+        targets_p = [p for p in (peer(j, base, now) for j in mine) if p]
+
+        def candidates(mtime):
+            return [p for p in peers[:bisect.bisect_right(starts, mtime)] if p["_span"][1] >= mtime]
+
+        # the files the targets could own, and every frame of any sequence they touch
+        wanted, touched = {}, set()
+        for t in targets_p:
+            lo, hi = t["_span"]
+            for mtime, path, size in files[bisect.bisect_left(times, lo):bisect.bisect_right(times, hi)]:
+                wanted[path] = (mtime, size)
+                k = sequence_key(path)
+                if k:
+                    touched.add(k[:3])
+        if touched:
+            for mtime, path, size in files:
+                k = sequence_key(path)
+                if k and k[:3] in touched:
+                    wanted[path] = (mtime, size)
+        owner = {path: owner_of(path, mt, candidates(mt)) for path, (mt, sz) in wanted.items()}
+        votes = {}
+        for path, o in owner.items():
+            k = sequence_key(path)
+            if k and o:
+                votes.setdefault(k[:3], {}).setdefault(o["id"], 0)
+                votes[k[:3]][o["id"]] += 1
+        for path in owner:
+            k = sequence_key(path)
+            if k and k[:3] in votes and sum(votes[k[:3]].values()) >= SEQUENCE_MIN:
+                winner = max(votes[k[:3]].items(), key=lambda kv: (kv[1], kv[0]))[0]
+                owner[path] = {"id": winner}
+        for job in mine:
+            owned = {p: wanted[p] for p, o in owner.items() if o and o["id"] == job["id"]}
+            items, truncated = group_media(owned)
+            save_artifacts(job, items, truncated, now)
+
+
+def needs_artifacts(job, now):
+    if job["status"] not in TERMINAL or not job.get("finished") or now - job["finished"] < ARTIFACT_SETTLE:
+        return False
+    if now - job["finished"] > ARTIFACT_DAYS * 86400:
+        return False
+    a = job.get("artifacts")
+    return not a or a.get("at", 0) < job["finished"] + ARTIFACT_SETTLE - 1
+
+
+def artifact_indexer():
+    """Dispatcher thread: soon after a job ends, find what it produced (scans take seconds, so not in the loop)."""
+    while True:
+        try:
+            now = time.time()
+            jobs = all_jobs()
+            targets = sorted((j for j in jobs if needs_artifacts(j, now)), key=lambda j: -j["finished"])[:2000]
+            if targets:
+                index_artifacts(targets, jobs)
+        except Exception as e:
+            print("rq: artifact indexer: %r" % e, flush=True)
+        time.sleep(10)
+
+
+def frame_path(item, frame):
+    if not any(a <= frame <= b for a, b in item["frames"]):
+        return None
+    return os.path.join(item["dir"], "%s%0*d%s" % (item["prefix"], item["width"], frame, item["ext"]))
+
+
+def display_path(path, project):
+    """A path as the page shows it: relative to the project folder, or scratch/... inside a scratchpad."""
+    base = os.path.realpath(os.path.join(ROOT, project))
+    if (path + "/").startswith(base + "/"):
+        return os.path.relpath(path, base)
+    m = re.search(r"/scratchpad/(.*)$", path)
+    if m:
+        return "scratch/" + m.group(1)
+    return os.path.basename(path)
+
+
+def load_artifacts(job_id):
+    return read_json(os.path.join(ARTIFACTS, job_id + ".json"), {}) or {}
+
+
+def job_artifacts(job):
+    """A job's artifacts for the page (found now if the dispatcher hasn't yet), without absolute paths."""
+    a = load_artifacts(job["id"])
+    if job["status"] in TERMINAL and not a:
+        index_artifacts([job], all_jobs())
+        a = load_artifacts(job["id"])
+    runs = job_runs(job)
+    until = (runs[-1][1] + ARTIFACT_GRACE) if runs else 0
+    out = []
+    for item in a.get("items", []):
+        ext = (item.get("ext") or os.path.splitext(item.get("path", ""))[1]).lower()
+        view = dict(key=item.get("key") or "", kind=item["kind"], size=item["size"], mtime=item["mtime"], ext=ext,
+                    browser=ext not in NO_BROWSER_EXT)
+        if item["kind"] == "sequence":
+            view.update(media=item["media"], frames=item["frames"], count=item["count"], width=item["width"],
+                        name="%s%s%s" % (item["prefix"], "#" * max(item["width"], 1), item["ext"]),
+                        dir=display_path(item["dir"], job["project"]), exists=os.path.isdir(item["dir"]))
+        else:
+            try:
+                now_mtime = os.stat(item["path"]).st_mtime
+                exists = True
+            except OSError:
+                now_mtime, exists = None, False
+            view.update(name=os.path.basename(item["path"]),
+                        dir=os.path.dirname(display_path(item["path"], job["project"])), exists=exists,
+                        changed=bool(exists and until and now_mtime > until))
+        out.append(view)
+    return {"id": job["id"], "project": job["project"], "name": job["name"], "status": job["status"],
+            "kind": job.get("kind"), "tools": job.get("tools"), "command": job.get("command"),
+            "started": job.get("started"), "finished": job.get("finished"), "exit": job.get("exit"),
+            "artifacts": out, "truncated": a.get("truncated", 0), "indexed": bool(a),
+            "pending": job["status"] not in TERMINAL}
+
+
+def artifact_target(job_id, key, frame=None):
+    """The file (or the folder, for a whole sequence) an artifact key names, re-checked on disk: a regular picture
+    or video file inside the project's own folders, never anything a symlink swapped in since."""
+    if not re.match(r"^[A-Za-z0-9_.-]+$", job_id or "") or not re.match(r"^[0-9a-f]{12}$", key or ""):
+        return None
+    job = load_job(job_id)
+    item = next((i for i in load_artifacts(job_id).get("items") or [] if i.get("key") == key), None)
+    if not job or not item:
+        return None
+    tops = project_dirs(job["project"])
+    if item["kind"] == "sequence" and frame is None:
+        path = os.path.realpath(item["dir"])
+        return path if os.path.isdir(path) and inside(path, tops) else None
+    path = frame_path(item, frame) if item["kind"] == "sequence" else item["path"] if frame is None else None
+    if not path:
+        return None
+    path = os.path.realpath(path)
+    try:
+        ok = stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return None
+    return path if ok and os.path.splitext(path)[1].lower() in MEDIA_EXT and inside(path, tops) else None
+
+
 # ---------- dispatcher ----------
 
 def repair_grants(jobs):
@@ -736,7 +1128,7 @@ def dispatch_once(state):
     give_turn(GRANT, job["id"])
     if job.get("resume_by_dispatcher") and group_alive(job.get("pgid")):  # moved from outside: continue it here
         os.killpg(job["pgid"], signal.SIGCONT)
-        job.update(status="running", granted=time.time(), resumed=time.time())
+        job.update(status="running", granted=time.time(), resumed=time.time(), stopped=close_stop(job))
     else:
         job.update(status="granted", granted=time.time())
     save_job(job)
@@ -753,7 +1145,9 @@ def cmd_daemon(args):
     except OSError:
         sys.exit("rq: a dispatcher is already running (%s)" % dispatcher_state().get("pid"))
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Page)
+    server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=artifact_indexer, daemon=True).start()
     print("rq: dispatcher running, status page on http://localhost:%d" % args.port, flush=True)
     state = {"pid": os.getpid(), "since": time.time(), "port": args.port, "outside_seen": time.time()}
     while True:
@@ -951,7 +1345,7 @@ def cap_light(job_id, proc):
             os.killpg(proc.pid, signal.SIGSTOP)
         except ProcessLookupError:
             return
-        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time())
+        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(), stopped=open_stop(job))
         save_job(job)
         say("ran longer than %s as light work while other work is waiting: paused and moved into the queue, "
             "continuing when it's its turn" % fmt_duration(LIGHT_CAP))
@@ -961,7 +1355,7 @@ def cap_light(job_id, proc):
                 return  # cmd_cancel continues and stops the processes
             if granted() == job_id:
                 job = load_job(job_id) or job
-                job.update(status="running", resumed=time.time())
+                job.update(status="running", resumed=time.time(), stopped=close_stop(job))
                 save_job(job)
                 os.killpg(proc.pid, signal.SIGCONT)
                 say("its turn: continuing")
@@ -1001,6 +1395,8 @@ def cmd_pause(args, pause=True):
         sys.exit("rq: %s isn't running" % job["id"])
     os.killpg(job["pgid"], signal.SIGSTOP if pause else signal.SIGCONT)
     set_flag(job["id"], "paused", pause)
+    job["stopped"] = open_stop(job) if pause else close_stop(job)
+    save_job(job)
     print("rq: %s %s (it keeps its turn)" % ("paused" if pause else "resumed", job["id"]))
 
 
@@ -1031,7 +1427,7 @@ def cmd_move(args):
             sys.exit("rq: %s isn't a running light job" % job["id"])
         set_flag(job["id"], "keep")  # its own client must not move it again
         os.killpg(job["pgid"], signal.SIGSTOP)
-        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(),
+        job.update(kind="heavy", status="queued", promoted=time.time(), submitted=time.time(), stopped=open_stop(job),
                    resume_by_dispatcher=True)
         save_job(job)
         print("rq: paused %s and moved it to the end of the main queue; it continues when it's its turn" % job["id"])
@@ -1094,8 +1490,17 @@ def cmd_status(args):
 # ---------- status page ----------
 
 class Page(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive and ranges, which video players rely on
+    timeout = 120  # idle kept-alive connections end instead of holding a thread forever
+
     def log_message(self, *args):
         pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except (ConnectionError, socket.timeout):
+            pass  # the browser dropped or reset the connection (closing a tab, seeking in a video)
 
     def send(self, body, kind="text/html; charset=utf-8", code=200):
         data = body.encode()
@@ -1104,15 +1509,117 @@ class Page(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def local_host(self):
+        """Only requests addressed to this machine's page (blocks other web pages reaching it via DNS rebinding)."""
+        host = (self.headers.get("Host") or "").lower()
+        port = self.server.server_address[1]
+        return host in ("localhost:%d" % port, "127.0.0.1:%d" % port, "[::1]:%d" % port)
+
+    def same_origin(self):
+        """A POST must come from the status page itself, not from another web page in the browser."""
+        origin = self.headers.get("Origin")
+        port = self.server.server_address[1]
+        return origin in ("http://localhost:%d" % port, "http://127.0.0.1:%d" % port, "http://[::1]:%d" % port)
+
+    def target(self, rest):
+        """<job>/<key>[/<frame>] to the artifact's file, or None."""
+        parts = rest.split("/")
+        if len(parts) not in (2, 3) or (len(parts) == 3 and not parts[2].isdigit()):
+            return None
+        return artifact_target(parts[0], parts[1], int(parts[2]) if len(parts) == 3 else None)
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
+        if not self.local_host():
+            return self.send("forbidden", "text/plain", 403)
+        path = self.path.split("?")[0]
+        if path == "/":
             with open(os.path.join(HOME, "status.html")) as f:
                 return self.send(f.read())
-        if self.path == "/api/status":
+        if path == "/api/status":
             return self.send(json.dumps(snapshot()), "application/json")
+        m = re.match(r"^/api/job/([A-Za-z0-9_.-]+)$", path)
+        if m:
+            job = load_job(m.group(1))
+            if not job:
+                return self.send("not found", "text/plain", 404)
+            return self.send(json.dumps(job_artifacts(job)), "application/json")
+        if path.startswith("/api/file/"):
+            target = self.target(path[len("/api/file/"):])
+            if not target or os.path.isdir(target):
+                return self.send("not found", "text/plain", 404)
+            return self.send_file(target)
         self.send("not found", "text/plain", 404)
+
+    def do_POST(self):
+        """/api/open/<job>/<key>[/<frame>]: open an artifact on this machine with its usual app;
+        /api/reveal/...: show it in the Finder. For a whole sequence: its folder."""
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(min(length, 65536))
+        if not self.local_host() or not self.same_origin():
+            return self.send("forbidden", "text/plain", 403)
+        m = re.match(r"^/api/(open|reveal)/(.+)$", self.path.split("?")[0])
+        target = self.target(m.group(2)) if m else None
+        if not target:
+            return self.send("not found", "text/plain", 404)
+        argv = ["open", target] if m.group(1) == "open" else ["open", "-R", target]
+        if os.environ.get("RQ_DRY_OPEN"):  # tests: say what would run
+            return self.send(json.dumps({"would_run": argv}), "application/json")
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.send(json.dumps({"ok": True}), "application/json")
+
+    def send_file(self, target):
+        """A file with byte ranges (Safari plays video only with them), streamed in chunks. Headers and bytes come
+        from the same open file; if it ends early (overwritten meanwhile), the connection closes instead of hanging."""
+        try:
+            f = open(target, "rb")
+        except OSError:
+            return self.send("not found", "text/plain", 404)
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            start, end, partial = 0, size - 1, False
+            rng = re.match(r"^bytes=(\d*)-(\d*)$", (self.headers.get("Range") or "").strip())
+            if rng and (rng.group(1) or rng.group(2)):
+                if rng.group(1):
+                    start = int(rng.group(1))
+                    end = min(int(rng.group(2)), size - 1) if rng.group(2) else size - 1
+                else:  # the last N bytes
+                    start = max(0, size - int(rng.group(2)))
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", mimetypes.guess_type(target)[0] or "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(end - start + 1))
+            if partial:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            try:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(1048576, left))
+                    if not chunk:
+                        self.close_connection = True  # the file got shorter: end the response here
+                        return
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+            except OSError:
+                self.close_connection = True  # the browser stopped reading (seeking, closing the sheet)
 
 
 def main():

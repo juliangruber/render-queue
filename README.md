@@ -120,6 +120,7 @@ This machine is shared with other sessions through one render queue: heavy jobs 
   notification when the job is done.
 - Watch the status page: what renders now, the queue with expected start and end times, cores per project, the GPU,
   work outside the queue that holds it up, and the sessions waiting for you (click one to open it).
+- Click a job under "Recent" to see what it produced: its videos, pictures and frame sequences.
 - Tell the queue session when you want to change the order or a job: "go for ID", "cancel ID", "let ID run on",
   "ID will take 2h". After a restart: "start the dispatcher".
 - To change a rule for all render sessions, change the snippet in their `CLAUDE.md`, or ask the queue session to send
@@ -174,6 +175,19 @@ http://localhost:8642 shows which sessions are waiting for you, the cores each p
 project), the GPU utilization, the running job and light work, the queue with expected start and end times, heavy
 work outside rq, and recent jobs with how long they took. It listens on 127.0.0.1 only and shows no job output.
 
+Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what it produced:
+
+- **Videos** play in the page, **pictures** show in a grid with a full-size view (arrow keys step through them), and
+  **frame sequences** (24 or more numbered files in one folder) get a scrubber over their frames.
+- What the browser can't show (EXR always; ProRes outside Safari, TIFF outside Safari) isn't converted: the page
+  offers **Open on Mac** (opens the file in its usual app) and **Show in Finder** instead. A whole sequence opens as
+  its folder.
+- rq finds a job's files on its own, a few seconds after the job ends: pictures and videos (png, jpg, webp, gif, avif,
+  tiff, heic, exr, mp4, mov, m4v, webm, mkv, avi) that changed in the project's folder or its Claude Code
+  scratchpads while the job ran. When several jobs of a project ran at the same time, a file goes to the job whose
+  working folder contains it, else to the shortest of them, so files written by other work at the same time can show
+  up too. Jobs that ended more than 2 days before the dispatcher started are looked at when you open them.
+
 ## How it works
 
 - `state/` (not in git) holds one JSON file per job, the logs, the current turns and the dispatcher's heartbeat.
@@ -189,6 +203,10 @@ work outside rq, and recent jobs with how long they took. It listens on 127.0.0.
   starts (two levels deep). The status page shows them as logos in the Tool(s) column.
 - Cores per project come from `ps` and each process's working directory (or a parent's) under the projects' root, or
   its Claude Code scratchpad.
+- A dispatcher thread looks for each finished job's pictures and videos (one scan of the project's folders per round)
+  and saves them in `state/artifacts/ID.json`, with a count in the job's record. The page fetches a file by the job and
+  its position in that list, never by path, so it can only hand out files a job produced; opening one on the Mac
+  needs a POST from the page itself.
 
 ## Configuration
 
@@ -198,6 +216,7 @@ work outside rq, and recent jobs with how long they took. It listens on 127.0.0.
 | `RQ_STATE` | `render-queue/state` | every rq command | jobs, logs, the dispatcher's state, `sessions.json` |
 | `RQ_LIGHT_CAP` | `300` | `rq light` | seconds a light job may run before it moves into the queue |
 | `RQ_QUIET_WINDOW` | `120` | the dispatcher | seconds without outside work before the next job starts |
+| `RQ_SCRATCH_GLOB` | `/private/tmp/claude-*/` | the dispatcher | where Claude Code keeps scratchpads (for artifacts) |
 
 Set `RQ_ROOT` and `RQ_STATE` the same for the queue session, which starts the dispatcher (it inherits the session's
 environment) and runs the queue commands, and for the render sessions: in the `env` of `.claude/settings.json` in the

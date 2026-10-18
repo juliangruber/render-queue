@@ -70,6 +70,55 @@ a.proj:hover { border-bottom-color: var(--ink); }
 .prog + .prog { margin-left: 4px; }
 #tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 6px 9px; font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,.18); display: none; z-index: 10; }
+tr.click { cursor: pointer; }
+tr.click:hover td, tr.click:focus-visible td { background: var(--code); }
+tr.click:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tile .pic:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.changed { color: var(--warn); }
+.out { color: var(--muted); font-size: 13px; white-space: nowrap; }
+/* the sheet: what a finished job produced */
+#sheet[hidden], #lightbox[hidden] { display: none; }
+#sheet { position: fixed; inset: 0; z-index: 20; }
+.sheet-back { position: absolute; inset: 0; background: rgba(0,0,0,.5); }
+.sheet-panel { position: absolute; top: 24px; bottom: 24px; left: 50%; transform: translateX(-50%);
+  width: min(1100px, calc(100% - 32px)); overflow: auto; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.35); }
+.sheet-head { position: sticky; top: 0; z-index: 1; display: flex; gap: 12px; align-items: flex-start; justify-content: space-between;
+  padding: 16px 20px 12px; background: var(--bg); border-bottom: 1px solid var(--line); }
+.sheet-head .row { font-size: 17px; }
+#sheet-body { padding: 4px 20px 24px; }
+#sheet-body h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 22px 0 10px; font-weight: 600; }
+button { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 7px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
+.acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.acts a { font-size: 13px; color: var(--accent); }
+.vid { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+.vid video { display: block; width: 100%; max-height: 62vh; background: #000; border-radius: 6px; }
+.fname { font-size: 14px; word-break: break-all; }
+.fname .sub { margin-left: 6px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; display: flex; flex-direction: column; }
+.tile .pic { aspect-ratio: 16 / 10; background: #111; display: flex; align-items: center; justify-content: center; cursor: zoom-in; }
+.tile .pic img { width: 100%; height: 100%; object-fit: contain; }
+.tile .cap { padding: 6px 8px; font-size: 12px; word-break: break-all; }
+.tile .cap .acts { margin-top: 4px; }
+.tile.file .pic { cursor: default; color: var(--muted); font-size: 12px; padding: 10px; text-align: center; background: var(--code); }
+.seq { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+.seq .frame { background: #111; border-radius: 6px; display: flex; justify-content: center; margin-top: 10px; }
+.seq .frame img { max-width: 100%; max-height: 56vh; object-fit: contain; }
+.seq input[type=range] { width: 100%; margin: 10px 0 2px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 22px; }
+#lightbox { position: fixed; inset: 0; z-index: 30; background: #0b0b0a; display: flex; flex-direction: column; }
+#lightbox .lb-img { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 12px; }
+#lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; }
+#lightbox .lb-bar { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 10px 14px; color: #ddd; font-size: 13px; }
+#lightbox .lb-bar .fname { color: #ddd; }
+#toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 40; background: var(--ink); color: var(--bg);
+  padding: 7px 14px; border-radius: 8px; font-size: 13px; display: none; }
+@media (max-width: 600px) { .sheet-panel { top: 0; bottom: 0; width: 100%; border-radius: 0; border: none; }
+  .sheet-head { padding: 12px 16px 10px; } #sheet-body { padding: 4px 16px 20px; } .grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 600px) { .hide-sm { display: none; } th, td { padding: 7px 8px; } }
 </style>
 </head>
@@ -101,6 +150,21 @@ a.proj:hover { border-bottom-color: var(--ink); }
   <h2>Recent</h2>
   <div id="recent"></div>
 </main>
+<div id="sheet" hidden role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+  <div class="sheet-back"></div>
+  <div class="sheet-panel">
+    <div class="sheet-head"><div><div id="sheet-title" class="row"></div><div id="sheet-meta" class="sub" style="margin-top:4px"></div></div>
+      <button class="x" id="sheet-close" aria-label="Close">×</button></div>
+    <div id="sheet-body"></div>
+  </div>
+</div>
+<div id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Picture">
+  <div class="lb-img"><img id="lb-img" alt=""><div id="lb-msg" hidden style="color:#bbb;font-size:14px"></div></div>
+  <div class="lb-bar"><button id="lb-prev" aria-label="Previous picture">‹</button>
+    <div style="flex:1;min-width:0"><div id="lb-name" class="fname"></div><div class="acts" id="lb-acts"></div></div>
+    <button id="lb-next" aria-label="Next picture">›</button><button id="lb-close" aria-label="Close">×</button></div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
 <script>
 const $ = id => document.getElementById(id);
 // the tab icon: an old movie camera with two film reels; an amber dot while a session waits for you
@@ -303,12 +367,226 @@ async function refresh() {
     ${lq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">light</span></td>
       <td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td></tr>`).join("")}</table>` : "";
 
-  $("recent").innerHTML = s.finished.length ? `<table><tr><th>Finished</th><th>Project</th><th>Job</th><th>Tool(s)</th><th>Took</th><th>Result</th></tr>
-    ${s.finished.slice(0, 10).map(j => `<tr><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" ? ' <span class="tag">light</span>' : ""}</td>
+  const recent = s.finished.length ? `<table><tr><th>Finished</th><th>Project</th><th>Job</th><th>Tool(s)</th><th>Took</th><th>Result</th><th class="hide-sm">Output</th></tr>
+    ${s.finished.slice(0, 10).map(j => `<tr class="click" data-job="${esc(j.id)}" tabindex="0" title="Show the pictures and videos it produced"><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" ? ' <span class="tag">light</span>' : ""}</td>
     <td>${programTool(j)}</td><td class="num">${j.started && j.finished ? dur(j.finished - j.started) : "-"}</td>
-    <td><span class="tag ${esc(j.status)}">${esc(j.status)}${j.exit != null && j.status === "failed" ? " " + j.exit : ""}</span></td></tr>`).join("")}</table>`
+    <td><span class="tag ${esc(j.status)}">${esc(j.status)}${j.exit != null && j.status === "failed" ? " " + j.exit : ""}</span></td>
+    <td class="out hide-sm">${outputText(j, s.now)}</td></tr>`).join("")}</table>`
     : `<div class="empty">No finished jobs yet.</div>`;
+  if (recent !== refresh.recent) {  // rebuilding every 3 s would drop keyboard focus and swallow clicks
+    const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest("#recent tr[data-job]");
+    $("recent").innerHTML = refresh.recent = recent;
+    if (focused) { const row = $("recent").querySelector(`tr[data-job="${CSS.escape(focused.dataset.job)}"]`); if (row) row.focus(); }
+  }
 }
+
+
+// ---------- the sheet: what a finished job produced ----------
+const ARTIFACT_DAYS = 2;  // the dispatcher looks for files of jobs this recent; older ones when their sheet opens
+const outputText = (j, now) => {
+  if (!j.started) return "";
+  if (!j.artifacts) return now - (j.finished || 0) < ARTIFACT_DAYS * 86400 ? "…" : "";
+  return j.artifacts.count ? `${j.artifacts.count} file${j.artifacts.count > 1 ? "s" : ""}` : "-";
+};
+const size = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? Math.round(b / 1e3) + " KB" : b + " B";
+let sheet = null;  // {job, pictures: [artifact], lb: index, opener: job id}
+const byKey = key => sheet && sheet.job.artifacts.find(a => a.key === key);
+const fileUrl = (a, frame) => `/api/file/${encodeURIComponent(sheet.job.id)}/${a.key}${frame != null ? "/" + frame : ""}?v=${Math.round(a.mtime)}`;
+const toast = text => { const el = $("toast"); el.textContent = text; el.style.display = "block";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => el.style.display = "none", 2200); };
+async function onMac(how, key, frame) {
+  try {
+    const r = await fetch(`/api/${how}/${encodeURIComponent(sheet.job.id)}/${key}${frame != null ? "/" + frame : ""}`, {method: "POST"});
+    toast(r.ok ? (how === "open" ? "Opened on the Mac" : "Shown in the Finder") : "The file isn't there any more");
+  } catch (e) { toast("The status page is offline"); }
+}
+// buttons for a file: open it on the Mac with its usual app, show it in the Finder, the file itself in a new tab
+const acts = (a, frame, inBrowser) => `<div class="acts">
+  <button data-mac="open" data-key="${a.key}"${frame != null ? ` data-frame="${frame}"` : ""}>Open on Mac</button>
+  <button data-mac="reveal" data-key="${a.key}"${frame != null ? ` data-frame="${frame}"` : ""}>Show in Finder</button>
+  ${inBrowser ? `<a href="${fileUrl(a, frame)}" target="_blank" rel="noopener">full file ↗</a>` : ""}</div>`;
+// a sequence's frames: ranges of numbers, picked by position
+const frameAt = (a, i) => { for (const [lo, hi] of a.frames) { if (i <= hi - lo) return lo + i; i -= hi - lo + 1; } return a.frames[a.frames.length - 1][1]; };
+const frameName = (a, f) => a.name.replace(/#+/, a.width ? String(f).padStart(a.width, "0") : String(f));
+const changedNote = a => a.changed ? ' <span class="changed">changed since this job</span>' : "";
+const cantShow = a => `${esc(a.ext.slice(1).toUpperCase())}: this browser can't show it`;
+const fileCard = (a, why) => `<div class="tile file"><div class="pic">${why}</div>
+  <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}${changedNote(a)}</div>${a.exists ? acts(a, null, false) : ""}</div></div>`;
+const AUTOLOAD_VIDEOS = 3;  // more at once can stall a browser's connections to the page (Firefox)
+
+function videoCard(a, i) {
+  if (!a.exists) return `<div class="vid"><div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · gone since</span></div></div>`;
+  const player = i < AUTOLOAD_VIDEOS
+    ? `<video controls preload="metadata" playsinline src="${fileUrl(a)}"></video>`
+    : `<video controls preload="none" playsinline data-src="${fileUrl(a)}" hidden></video>
+       <button data-load="${a.key}">▶ Load video</button>`;
+  return `<div class="vid" data-key="${a.key}">${player}
+    <div class="fname" style="margin-top:8px">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${size(a.size)}</span>${changedNote(a)}</div>${acts(a, null, true)}</div>`;
+}
+
+// a video this browser can't play (e.g. ProRes outside Safari): a note and the Mac buttons instead
+function watchVideo(el) {
+  const fail = () => { const card = el.closest(".vid"); if (!card) return;
+    card.querySelectorAll('a[target="_blank"], button[data-load]').forEach(x => x.remove());
+    releaseVideo(el);
+    el.outerHTML = `<div class="tile file" style="border:none"><div class="pic" style="aspect-ratio:auto;padding:18px">This browser can't play this video. Open it on the Mac instead.</div></div>`; };
+  el.addEventListener("error", fail);
+  el.addEventListener("loadedmetadata", () => { if (!el.videoWidth) fail(); });
+  if (el.error) fail();
+  else if (el.readyState >= 1 && !el.videoWidth) fail();
+}
+function releaseVideo(el) { try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {} }
+
+function renderSheet(v) {
+  sheet.job = v;
+  $("sheet-title").innerHTML = `<span class="proj">${esc(v.project)}</span><span class="name">${esc(v.name)}</span>${v.kind === "light" ? ' <span class="tag">light</span>' : ""}
+    ${jobLogos(v)} <span class="tag ${esc(v.status)}">${esc(v.status)}${v.exit != null && v.status === "failed" ? " " + v.exit : ""}</span>`;
+  $("sheet-meta").textContent = v.pending ? (v.started ? `running since ${day(v.started)}` : "waiting in the queue")
+    : v.started ? `${day(v.started)} to ${day(v.finished)} · took ${dur(v.finished - v.started)}` : "never started";
+  if (v.pending) {
+    $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">This job hasn't finished yet. Its pictures and videos show up here a few seconds after it ends.</div>`;
+    return;
+  }
+  const videos = v.artifacts.filter(a => a.kind === "video"), pictures = v.artifacts.filter(a => a.kind === "image"),
+        seqs = v.artifacts.filter(a => a.kind === "sequence");
+  sheet.pictures = pictures.filter(a => a.browser && a.exists);
+  let out = "";
+  if (videos.length) out += `<h3>Videos · ${videos.length}</h3>` + videos.map(videoCard).join("");
+  if (pictures.length) out += `<h3>Pictures · ${pictures.length}</h3><div class="grid">` + pictures.map(a => !a.exists
+    ? `<div class="tile file"><div class="pic">gone since</div><div class="cap"><div class="fname">${esc(a.name)}</div></div></div>`
+    : !a.browser ? fileCard(a, `${esc(a.ext.slice(1).toUpperCase())}: browsers can't show this`)
+    : `<div class="tile" data-key="${a.key}"><div class="pic" data-lb="${a.key}" tabindex="0" role="button" aria-label="Show ${esc(a.name)} full size"><img loading="lazy" decoding="async" src="${fileUrl(a)}" alt="${esc(a.name)}"></div>
+        <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}${changedNote(a)}</div></div></div>`).join("") + "</div>";
+  if (seqs.length) out += `<h3>Frame sequences · ${seqs.length}</h3>` + seqs.map(a => {
+    const first = a.frames[0][0], last = a.frames[a.frames.length - 1][1];
+    const head = `<div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${a.count} frames, ${first} to ${last} · ${size(a.size)}</span></div>`;
+    const folder = `<div class="acts"><button data-mac="open" data-key="${a.key}">Open folder on Mac</button><button data-mac="reveal" data-key="${a.key}">Show in Finder</button></div>`;
+    if (!a.exists) return `<div class="seq">${head}<div class="sub">gone since</div></div>`;
+    if (!a.browser) return `<div class="seq">${head}<div class="sub" style="margin-top:6px">${esc(a.ext.slice(1).toUpperCase())}: browsers can't show these frames</div>${folder}</div>`;
+    return `<div class="seq" data-seq="${a.key}">${head}
+      <div class="frame"><img alt="" src="${fileUrl(a, first)}"></div>
+      <input type="range" min="0" max="${a.count - 1}" value="0" aria-label="Frame">
+      <div class="acts"><button data-step="-1" aria-label="Previous frame">‹</button><button data-step="1" aria-label="Next frame">›</button>
+        <span class="sub" data-label>${esc(frameName(a, first))} · 1 of ${a.count}</span></div>${folder}</div>`;
+  }).join("");
+  if (!v.artifacts.length) out += `<div class="empty" style="margin-top:18px">${v.started ? "No pictures or videos found for this job." : "This job never started."}</div>`;
+  if (v.truncated) out += `<div class="note">${v.truncated} more pictures or videos aren't shown.</div>`;
+  if (v.started) out += `<div class="note">Pictures and videos that changed in ${esc(v.project)}'s folder and its scratch folders while this job ran.
+    Files written by other work at the same time can show up here too.</div>`;
+  $("sheet-body").innerHTML = out;
+  $("sheet-body").querySelectorAll(".vid video").forEach(watchVideo);
+  // a picture this browser can't show (e.g. TIFF outside Safari): a note and the Mac buttons instead
+  $("sheet-body").querySelectorAll(".tile img").forEach(el => {
+    const fail = () => { const tile = el.closest(".tile"); if (!tile) return; const a = byKey(tile.dataset.key);
+      sheet.pictures = sheet.pictures.filter(p => p.key !== a.key);
+      tile.outerHTML = fileCard(a, cantShow(a)); };
+    el.addEventListener("error", fail);
+    if (el.complete && !el.naturalWidth && el.getAttribute("src")) fail();
+  });
+  $("sheet-body").querySelectorAll("[data-seq]").forEach(setupSequence);
+}
+
+// scrubbing a sequence: load one frame at a time, always the newest asked for
+function setupSequence(card) {
+  const a = byKey(card.dataset.seq), img = card.querySelector("img"), range = card.querySelector("input"),
+        label = card.querySelector("[data-label]");
+  let want = 0, loading = false, shown = false;
+  const cannot = async () => {  // the first frame failed: gone, or a format this browser can't show
+    let gone = false;
+    try { gone = !(await fetch(img.src, {method: "HEAD"})).ok; } catch (e) {}
+    card.querySelector(".frame").outerHTML = `<div class="sub" style="margin-top:6px">${gone ? "the frames are gone" : esc(a.ext.slice(1).toUpperCase()) + ": this browser can't show these frames"}</div>`;
+    range.remove(); card.querySelectorAll("[data-step]").forEach(b => b.remove()); label.remove();
+  };
+  img.onload = () => { shown = true; };
+  img.onerror = () => { if (!shown) cannot(); };
+  const show = () => { if (loading || !shown) return; loading = true; const i = want, f = frameAt(a, i);
+    img.src = fileUrl(a, f); label.textContent = `${frameName(a, f)} · ${i + 1} of ${a.count}`;
+    const done = () => { loading = false; if (want !== i) show(); };
+    img.onload = done; img.onerror = () => { label.textContent = `${frameName(a, f)} is gone`; done(); }; };
+  range.addEventListener("input", () => { want = +range.value; show(); });
+  card.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
+    want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));
+}
+
+async function openSheet(id, opener) {
+  closeLightbox();
+  releaseVideos();
+  sheet = {job: {id, artifacts: []}, pictures: [], opener: opener || (sheet && sheet.opener)};
+  $("sheet").hidden = false; document.body.style.overflow = "hidden";
+  $("sheet-title").textContent = ""; $("sheet-meta").textContent = "";
+  $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">Looking for the pictures and videos it produced…</div>`;
+  if (location.hash !== "#job=" + id) history.replaceState(null, "", "#job=" + id);
+  $("sheet-close").focus();
+  try {
+    const r = await fetch("/api/job/" + encodeURIComponent(id), {cache: "no-store"});
+    if (!sheet || sheet.job.id !== id) return;
+    if (!r.ok) { $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">This job isn't known any more.</div>`; return; }
+    const v = await r.json();
+    if (sheet && sheet.job.id === id) renderSheet(v);
+  } catch (e) { if (sheet && sheet.job.id === id) $("sheet-body").innerHTML = `<div class="empty" style="margin-top:18px">The status page is offline.</div>`; }
+}
+function releaseVideos() { $("sheet-body").querySelectorAll("video").forEach(releaseVideo); }
+function closeSheet() {
+  closeLightbox();
+  releaseVideos();
+  const opener = sheet && sheet.opener;
+  $("sheet").hidden = true; document.body.style.overflow = ""; $("sheet-body").innerHTML = ""; sheet = null;
+  if (location.hash.startsWith("#job=")) history.replaceState(null, "", location.pathname);
+  const row = opener && $("recent").querySelector(`tr[data-job="${CSS.escape(opener)}"]`);
+  if (row) row.focus();
+}
+
+function openLightbox(key) {
+  const i = sheet.pictures.findIndex(p => p.key === key); if (i < 0) return;
+  sheet.lb = i; showLightbox(); $("lightbox").hidden = false; $("lb-close").focus();
+}
+function showLightbox() {
+  const a = sheet.pictures[sheet.lb], img = $("lb-img");
+  img.hidden = false; $("lb-msg").hidden = true;
+  img.onerror = () => {  // stepped onto a picture this browser can't decode
+    img.hidden = true; $("lb-msg").hidden = false; $("lb-msg").textContent = cantShow(a);
+    $("lb-acts").innerHTML = acts(a, null, false); };
+  img.src = fileUrl(a); img.alt = a.name;
+  $("lb-name").innerHTML = `${esc(a.name)} <span class="sub">${esc(a.dir)} · ${size(a.size)} · ${sheet.lb + 1} of ${sheet.pictures.length}</span>`;
+  $("lb-acts").innerHTML = acts(a, null, true);
+}
+function stepLightbox(d) { if (!sheet || !sheet.pictures.length) return;
+  sheet.lb = (sheet.lb + d + sheet.pictures.length) % sheet.pictures.length; showLightbox(); }
+function closeLightbox() {
+  const wasOpen = !$("lightbox").hidden;
+  $("lightbox").hidden = true; $("lb-img").removeAttribute("src");
+  const tile = wasOpen && sheet && sheet.pictures[sheet.lb] && $("sheet-body").querySelector(`[data-lb="${sheet.pictures[sheet.lb].key}"]`);
+  if (tile) tile.focus();
+}
+
+$("recent").addEventListener("click", e => { const row = e.target.closest("tr[data-job]"); if (row) openSheet(row.dataset.job, row.dataset.job); });
+$("recent").addEventListener("keydown", e => { const row = e.target.closest("tr[data-job]");
+  if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openSheet(row.dataset.job, row.dataset.job); } });
+$("sheet-close").addEventListener("click", closeSheet);
+document.querySelector(".sheet-back").addEventListener("click", closeSheet);
+document.addEventListener("click", e => {
+  if (!sheet) return;
+  const mac = e.target.closest("button[data-mac]");
+  if (mac) return onMac(mac.dataset.mac, mac.dataset.key, mac.dataset.frame != null ? +mac.dataset.frame : undefined);
+  const load = e.target.closest("button[data-load]");
+  if (load) { const el = load.closest(".vid").querySelector("video"); load.remove(); el.hidden = false;
+    el.preload = "metadata"; el.src = el.dataset.src; watchVideo(el); el.play().catch(() => {}); return; }
+  const pic = e.target.closest("[data-lb]"); if (pic) openLightbox(pic.dataset.lb);
+});
+$("sheet-body").addEventListener("keydown", e => { const pic = e.target.closest("[data-lb]");
+  if (pic && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openLightbox(pic.dataset.lb); } });
+$("lb-prev").addEventListener("click", () => stepLightbox(-1));
+$("lb-next").addEventListener("click", () => stepLightbox(1));
+$("lb-close").addEventListener("click", closeLightbox);
+document.addEventListener("keydown", e => {
+  if (!$("lightbox").hidden) {
+    if (e.key === "Escape") closeLightbox(); else if (e.key === "ArrowLeft") stepLightbox(-1); else if (e.key === "ArrowRight") stepLightbox(1);
+  } else if (!$("sheet").hidden && e.key === "Escape") closeSheet();
+});
+const fromHash = () => { const m = location.hash.match(/^#job=([A-Za-z0-9_.-]+)$/);
+  if (m && (!sheet || sheet.job.id !== m[1])) openSheet(m[1]); else if (!m && sheet) closeSheet(); };
+window.addEventListener("hashchange", fromHash);
+fromHash();
 
 refresh();
 setInterval(refresh, 3000);
