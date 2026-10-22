@@ -229,8 +229,9 @@ prompt, it tells the session which of its jobs no task watches and which results
   holds up the queue until it has ended, and the status page names it. A video project is one in
   `state/sessions.json` or one that has queued a job with rq; other projects' work (a benchmark in a code project,
   say) doesn't hold the queue. Heavy low-priority work outside rq is shown but doesn't
-  hold the queue. The next job starts only after 2 minutes without outside work, also right after the dispatcher
-  starts.
+  hold the queue. Once outside work that held the queue ends, the next job starts after 2 minutes without it
+  (a gap between two steps of a pipeline doesn't let a job in). Right after the dispatcher starts, a job starts at
+  once.
 
 ## Commands
 
@@ -309,7 +310,7 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
   (`state/owners/`) and a file per watcher (`state/watch/`).
 - The dispatcher checks every 2 s. When nothing is granted, it gives the turn to the first job in the queue (the
   oldest, unless one was moved first), once no heavy work at normal priority has been busy or paused outside the
-  queue for 2 minutes.
+  queue for 2 minutes (or since the dispatcher started).
 - `rq run` forks its supervisor twice with a new session in between, so it runs with launchd as its parent, out of
   reach of a session's task kill (Claude Code stops a task by signalling its process group and every descendant).
   The supervisor starts the command in a new process group (with `caffeinate -i`), its output into the log, and

@@ -2240,8 +2240,7 @@ def cmd_daemon(args):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     shutil.rmtree(os.path.join(STATE, "artifacts"), ignore_errors=True)  # what an older rq guessed jobs produced
     print("rq: dispatcher running, status page on http://localhost:%d" % args.port, flush=True)
-    state = {"pid": os.getpid(), "proto": PROTO, "since": time.time(), "port": args.port,
-             "outside_seen": time.time()}
+    state = {"pid": os.getpid(), "proto": PROTO, "since": time.time(), "port": args.port}
     tidied = 0
     while True:
         try:
