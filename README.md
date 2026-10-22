@@ -285,6 +285,10 @@ Tags say who sees a job (hover over one for more):
 The tab's icon gets an amber dot while a session waits for you, which includes a session whose turn ended while its
 jobs are unwatched or its results unseen.
 
+"Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a job that isn't
+light ends (not when it was cancelled; click to open its sheet) and when a session starts waiting for you (click to
+open the session, if `sessions.json` has a link for it).
+
 Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what is at the outputs it declared:
 
 - First the outputs themselves, one line each: a file (or "not there"), a folder with what it holds, a frame

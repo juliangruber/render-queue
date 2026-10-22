@@ -309,7 +309,8 @@ function showCores(u) {
   });
 }
 
-// a browser notification when a job that isn't light ends (not when it was cancelled), while this page is open
+// browser notifications while this page is open: a job that isn't light ends (not when it was cancelled), or a
+// session starts waiting for you
 const notifyKey = "rq-notify";
 const notifyOn = () => { try { return localStorage.getItem(notifyKey) === "1"; } catch (e) { return false; } };
 const showNotify = () => {
@@ -319,7 +320,7 @@ const showNotify = () => {
   const perm = Notification.permission;
   b.disabled = perm === "denied";
   b.textContent = perm === "denied" ? "Notifications blocked by the browser"
-    : perm === "granted" && notifyOn() ? "Notifying when a render ends" : "Notify me when a render ends";
+    : perm === "granted" && notifyOn() ? "Notifying: renders end, sessions wait" : "Notify me when a render ends or a session waits";
 };
 $("notify").addEventListener("click", async () => {
   if (Notification.permission !== "granted") {
@@ -344,6 +345,19 @@ const notifyEnded = finished => {
     n.onclick = () => { window.focus(); openSheet(j.id); n.close(); };
   }
 };
+let waitSeen = null;  // project -> state and since of each session waiting for you, as this page last saw it
+const notifyWaiting = sessions => {
+  const now = new Map((sessions || []).filter(x => !["working", "jobs"].includes(x.state))
+    .map(x => [x.project, {x, key: x.state + "@" + x.since}]));
+  const fresh = waitSeen ? [...now.values()].filter(w => waitSeen.get(w.x.project) !== w.key).map(w => w.x) : [];
+  waitSeen = new Map([...now].map(([p, w]) => [p, w.key]));
+  if (!notifyOn() || !("Notification" in window) || Notification.permission !== "granted") return;
+  for (const x of fresh) {
+    const n = new Notification(`${x.project} ${WAIT_LABEL[x.state] || "waiting for you"}`, {tag: "rq-session-" + x.project,
+      body: [x.tool || "", ...(x.notes || []).map(m => m.name + " " + m.what)].filter(Boolean).join(" · ")});
+    n.onclick = () => { window.focus(); if (x.link) location.href = x.link; n.close(); };
+  }
+};
 
 async function refresh() {
   let s;
@@ -357,6 +371,7 @@ async function refresh() {
     : `<span class="dot off"></span>dispatcher not running`;
   showWaiting(d.sessions);
   notifyEnded(s.finished);
+  notifyWaiting(d.sessions);
   favicon((d.sessions || []).some(x => !["working", "jobs"].includes(x.state)));
   showCores(d.usage);
   showGpu(d.gpu);
