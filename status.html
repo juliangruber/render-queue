@@ -174,25 +174,25 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 const $ = id => document.getElementById(id);
-// the tab icon: an old movie camera with two film reels; an amber dot while a session waits for you (also one whose
-// turn ended while none of its tasks watches its jobs: the dispatcher lists them, and its results nobody has seen,
-// in the session's notes)
-const favicon = waiting => {
-  const reel = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.2" fill="#e8e6e1"/>
+// the tab icon: an old movie camera with two film reels; an amber dot at the top while a session needs you (needsYou),
+// in color while a job runs (heavy or light), gray while the queue is idle
+const favicon = (waiting, rendering) => {
+  const body = rendering ? "#e8e6e1" : "#7d7a74", lens = rendering ? "#3987e5" : "#5a5853";
+  const reel = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.2" fill="${body}"/>
     <circle cx="${cx}" cy="${cy}" r="1.4" fill="#1d1c1a"/>
     <circle cx="${cx}" cy="${cy - 2.9}" r="1" fill="#1d1c1a"/><circle cx="${cx + 2.5}" cy="${cy + 1.45}" r="1" fill="#1d1c1a"/>
     <circle cx="${cx - 2.5}" cy="${cy + 1.45}" r="1" fill="#1d1c1a"/>`;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
     <rect width="32" height="32" rx="7" fill="#1d1c1a"/>
     ${reel(9, 9.5)}${reel(19.5, 9.5)}
-    <rect x="4" y="15.5" width="18" height="10.5" rx="2" fill="#e8e6e1"/>
-    <path d="M22 19.2 28.5 16v9.5L22 22.3z" fill="#3987e5"/>
-    <rect x="6.5" y="27" width="3" height="2" fill="#e8e6e1"/><rect x="16" y="27" width="3" height="2" fill="#e8e6e1"/>
+    <rect x="4" y="15.5" width="18" height="10.5" rx="2" fill="${body}"/>
+    <path d="M22 19.2 28.5 16v9.5L22 22.3z" fill="${lens}"/>
+    <rect x="6.5" y="27" width="3" height="2" fill="${body}"/><rect x="16" y="27" width="3" height="2" fill="${body}"/>
     ${waiting ? '<circle cx="26.5" cy="5.5" r="4.5" fill="#fab219" stroke="#1d1c1a" stroke-width="1.5"/>' : ""}</svg>`;
   const href = "data:image/svg+xml," + encodeURIComponent(svg);
   if ($("favicon").getAttribute("href") !== href) $("favicon").setAttribute("href", href);
 };
-favicon(false);
+favicon(false, false);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const t = ts => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false}) : "?";
 const day = ts => {
@@ -375,7 +375,7 @@ async function refresh() {
   showWaiting(d.sessions);
   notifyEnded(s.finished);
   notifyWaiting(d.sessions);
-  favicon((d.sessions || []).some(needsYou));
+  favicon((d.sessions || []).some(needsYou), !!(s.running || (s.light || []).length));
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;

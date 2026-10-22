@@ -282,7 +282,8 @@ Tags say who sees a job (hover over one for more):
 - A lost, cancelled or failed job shows why under its name (the full reason is in its sheet), for example "the Mac
   restarted", "rq cancel" or "its rq supervisor ended while the job was queued".
 
-The tab's icon gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
+The tab's icon, an old movie camera, is in color while a job runs (heavy or light) and gray while the queue is idle.
+It gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
 may wait for your permission, or its turn ended while its jobs are unwatched or its results unseen.
 
 "Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a job that isn't
