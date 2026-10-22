@@ -135,7 +135,8 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
       <h1>Render queue</h1>
       <div class="sub" id="dispatcher"><span class="dot"></span>connecting…</div>
     </div>
-    <div class="big" id="alldone"></div>
+    <div style="text-align:right"><div class="big" id="alldone"></div>
+      <button id="notify" hidden style="margin-top:6px"></button></div>
   </header>
 
   <div id="waiting"></div>
@@ -308,6 +309,42 @@ function showCores(u) {
   });
 }
 
+// a browser notification when a job that isn't light ends (not when it was cancelled), while this page is open
+const notifyKey = "rq-notify";
+const notifyOn = () => { try { return localStorage.getItem(notifyKey) === "1"; } catch (e) { return false; } };
+const showNotify = () => {
+  const b = $("notify");
+  if (!("Notification" in window)) { b.hidden = true; return; }
+  b.hidden = false;
+  const perm = Notification.permission;
+  b.disabled = perm === "denied";
+  b.textContent = perm === "denied" ? "Notifications blocked by the browser"
+    : perm === "granted" && notifyOn() ? "Notifying when a render ends" : "Notify me when a render ends";
+};
+$("notify").addEventListener("click", async () => {
+  if (Notification.permission !== "granted") {
+    if (await Notification.requestPermission() !== "granted") { showNotify(); return; }
+    try { localStorage.setItem(notifyKey, "1"); } catch (e) {}
+  } else {
+    try { localStorage.setItem(notifyKey, notifyOn() ? "0" : "1"); } catch (e) {}
+  }
+  showNotify();
+});
+showNotify();
+let ended = null;  // ids of jobs already ended when this page saw them
+const notifyEnded = finished => {
+  const fresh = ended ? finished.filter(j => !ended.has(j.id)) : [];
+  ended = new Set(finished.map(j => j.id));
+  if (!notifyOn() || !("Notification" in window) || Notification.permission !== "granted") return;
+  for (const j of fresh) {
+    if (j.kind === "light" || j.status === "cancelled") continue;
+    const result = j.status === "failed" && j.exit != null ? "failed " + j.exit : j.status;
+    const n = new Notification(`${j.project}/${j.name} ${result}`, {tag: "rq-" + j.id,
+      body: [j.took != null ? "took " + dur(j.took) : "", j.reason || ""].filter(Boolean).join(" · ")});
+    n.onclick = () => { window.focus(); openSheet(j.id); n.close(); };
+  }
+};
+
 async function refresh() {
   let s;
   try { s = await (await fetch("/api/status", {cache: "no-store"})).json(); }
@@ -319,6 +356,7 @@ async function refresh() {
     ? `<span class="dot on"></span>dispatcher running · ${esc(d.note || "")}`
     : `<span class="dot off"></span>dispatcher not running`;
   showWaiting(d.sessions);
+  notifyEnded(s.finished);
   favicon((d.sessions || []).some(x => !["working", "jobs"].includes(x.state)));
   showCores(d.usage);
   showGpu(d.gpu);
