@@ -257,10 +257,13 @@ const cores = n => n >= 10 ? n.toFixed(0) : n.toFixed(1);
 
 // sessions waiting for the user: read by the dispatcher from each session's transcript, longest waiting first
 const WAIT_LABEL = {waiting: "waiting for you", question: "asked you a question", permission: "may need your permission"};
+// a session that needs you to do something: a question, a permission prompt, or (its turn ended) jobs no task of it
+// watches or results it hasn't seen; a session that is only done with its turn doesn't
+const needsYou = x => x.state === "question" || x.state === "permission" || (x.state === "waiting" && (x.notes || []).length > 0);
 function showWaiting(sessions) {
   if (!sessions || !sessions.length) { $("waiting").innerHTML = ""; return; }  // no session watched (state/sessions.json)
   const now = Date.now() / 1000;
-  const waiting = sessions.filter(x => !["working", "jobs"].includes(x.state)).sort((a, b) => (a.since || 0) - (b.since || 0));
+  const waiting = sessions.filter(needsYou).sort((a, b) => (a.since || 0) - (b.since || 0));
   const working = sessions.filter(x => x.state === "working").map(x => x.project);
   const name = x => x.link ? `<a href="${esc(x.link)}" class="proj">${esc(x.project)}</a>` : `<span class="proj">${esc(x.project)}</span>`;
   // what the session may not know: its project's jobs that no task watches (they won't wake it), results nobody has seen
@@ -273,7 +276,7 @@ function showWaiting(sessions) {
       <td>${x.state === "waiting" ? WAIT_LABEL[x.state] : `<span class="tag paused">${WAIT_LABEL[x.state]}${x.tool ? " · " + esc(x.tool) : ""}</span>`}${notes(x)}</td>
       <td class="num">${x.since ? day(x.since) + ` <span class="sub">(${dur(now - x.since)})</span>` : "?"}</td>
       <td class="hide-sm sub">${x.background ? x.background + " task" + (x.background > 1 ? "s" : "") + " running" : ""}</td></tr>`).join("")}</table>`
-    : `<div class="empty">No session is waiting for you.</div>`}
+    : `<div class="empty">No session needs you.</div>`}
     ${working.length ? `<div class="sub" style="margin-top:8px">Working: ${working.map(esc).join(", ")}</div>` : ""}`;
 }
 
@@ -347,7 +350,7 @@ const notifyEnded = finished => {
 };
 let waitSeen = null;  // project -> state and since of each session waiting for you, as this page last saw it
 const notifyWaiting = sessions => {
-  const now = new Map((sessions || []).filter(x => !["working", "jobs"].includes(x.state))
+  const now = new Map((sessions || []).filter(needsYou)
     .map(x => [x.project, {x, key: x.state + "@" + x.since}]));
   const fresh = waitSeen ? [...now.values()].filter(w => waitSeen.get(w.x.project) !== w.key).map(w => w.x) : [];
   waitSeen = new Map([...now].map(([p, w]) => [p, w.key]));
@@ -372,7 +375,7 @@ async function refresh() {
   showWaiting(d.sessions);
   notifyEnded(s.finished);
   notifyWaiting(d.sessions);
-  favicon((d.sessions || []).some(x => !["working", "jobs"].includes(x.state)));
+  favicon((d.sessions || []).some(needsYou));
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;

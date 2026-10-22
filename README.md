@@ -62,8 +62,8 @@ A Claude Code session in the `render-queue` folder. It runs no renders itself.
    }
    ```
 
-   The page then shows when a session's turn has ended, when it asked you a question or when a tool call may wait
-   for your permission. While one of a session's tasks watches its job in the queue (`rq run` or `rq wait`), the
+   The page then shows when a session asked you a question or when a tool call may wait for your permission. A
+   session that only ended its turn isn't listed. While one of a session's tasks watches its job in the queue (`rq run` or `rq wait`), the
    session waits for that job, not for you. A job that no task watches won't wake the session when it ends, so then
    the session waits for you, with a note for each such job ("preview running, nobody watches it") and each result
    nobody has seen. This works best with sessions whose process rq finds: sessions in the Claude desktop app and
@@ -282,12 +282,12 @@ Tags say who sees a job (hover over one for more):
 - A lost, cancelled or failed job shows why under its name (the full reason is in its sheet), for example "the Mac
   restarted", "rq cancel" or "its rq supervisor ended while the job was queued".
 
-The tab's icon gets an amber dot while a session waits for you, which includes a session whose turn ended while its
-jobs are unwatched or its results unseen.
+The tab's icon gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
+may wait for your permission, or its turn ended while its jobs are unwatched or its results unseen.
 
 "Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a job that isn't
-light ends (not when it was cancelled; click to open its sheet) and when a session starts waiting for you (click to
-open the session, if `sessions.json` has a link for it).
+light ends (not when it was cancelled; click to open its sheet) and when a session shows up under "Waiting for you"
+(click to open the session, if `sessions.json` has a link for it).
 
 Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what is at the outputs it declared:
 
@@ -334,7 +334,8 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
   processes of a job it doesn't own, it checks that the group's leader is still the process the job started (its
   pid and start time). A group whose id another process got since counts as ended.
 - Every 5 s the dispatcher reads the tail of each watched session's transcript (and checks its Claude process) to show
-  which sessions wait for you: their turn ended, they asked a question, or a tool call may wait for permission. Turns
+  which sessions wait for you: they asked a question, a tool call may wait for permission, or their turn ended while
+  they have jobs that no task watches or results they haven't seen (a turn that only ended isn't shown). Turns
   that only answered another session are skipped. A session one of whose tasks watches a job in rq waits for that
   job, not for you.
 - Who watches a job: every `rq run` or `rq wait` that follows one holds an flock on its file in `state/watch/`,
