@@ -1011,10 +1011,10 @@ def rq_pids():
     return pids
 
 
-def strays(jobs=()):
+def strays(jobs=(), video=None):
     """Heavy work outside the queue, at normal priority (nice below QUIET_NICE), per process group: a busy or paused
-    Blender or ffmpeg (an encoder waiting for frames counts while its pipeline works), or a project's group
-    using more than about one core in total (e.g. a Python step)."""
+    Blender or ffmpeg (an encoder waiting for frames counts while its pipeline works), or a video project's group
+    using more than about one core in total (e.g. a Python step). video: the video projects (None: every project)."""
     if os.environ.get("RQ_IGNORE_OUTSIDE"):  # tests only
         return []
     procs = processes()
@@ -1048,7 +1048,7 @@ def strays(jobs=()):
         lead = max(renderers or members, key=lambda p: p["cpu"])
         cwd = cwd_of(lead["pid"])
         project = project_of(cwd)
-        if project == SELF or (not renderers and not project):
+        if project == SELF or (not renderers and (not project or (video is not None and project not in video))):
             continue
         project = project or "?"
         what = os.path.basename(lead["comm"]).lower()
@@ -2153,7 +2153,13 @@ def dispatch_once(state):
         state["queue"] = queue_view(jobs)
 
 
+def video_projects(jobs):
+    """The projects of the video sessions: those in sessions.json and those that ever queued a job."""
+    return {j.get("project") for j in jobs.values()} | set(read_json(SESSIONS, {}) or {})
+
+
 def dispatch_main(state, jobs):
+    video = video_projects(jobs)
     ours = [j for j in jobs.values() if j["status"] == "running" or (j["status"] == "queued" and j.get("pgid"))]
     grant = granted()
     note = ""
@@ -2176,12 +2182,12 @@ def dispatch_main(state, jobs):
         elif job["status"] == "granted" and time.time() - job.get("granted", 0) > 120:
             note = "%s: granted but not started yet" % grant
     if grant:
-        state["warnings"] = strays(ours)
+        state["warnings"] = strays(ours, video)
         state["note"] = note or "running %s" % grant
         return
     queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and j.get("kind") != "light"
                           and waits(j)])
-    state["warnings"] = strays(ours)
+    state["warnings"] = strays(ours, video)
     stopping = sorted(i for i in _cancels_sent if (jobs.get(i) or {}).get("status") == "queued")
     if queued and stopping:  # a frozen job nobody owns runs again until its processes end: not next to the next job
         state["note"] = "waiting for the processes of %s to end" % ", ".join(stopping)

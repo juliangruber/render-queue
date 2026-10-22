@@ -225,8 +225,10 @@ prompt, it tells the session which of its jobs no task watches and which results
   isn't moved, and a job that `rq pause` holds when its turn comes keeps its turn and stays paused until
   `rq resume ID`.
 - **Work outside the queue:** a busy or paused Blender or ffmpeg anywhere on the machine, or any other process group
-  in a project folder (or its Claude Code scratchpad) that uses more than about one core at normal priority, holds up
-  the queue until it has ended, and the status page names it. Heavy low-priority work outside rq is shown but doesn't
+  in a video project's folder (or its Claude Code scratchpad) that uses more than about one core at normal priority,
+  holds up the queue until it has ended, and the status page names it. A video project is one in
+  `state/sessions.json` or one that has queued a job with rq; other projects' work (a benchmark in a code project,
+  say) doesn't hold the queue. Heavy low-priority work outside rq is shown but doesn't
   hold the queue. The next job starts only after 2 minutes without outside work, also right after the dispatcher
   starts.
 
