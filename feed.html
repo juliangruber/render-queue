@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Render Outputs</title>
+<link rel="icon" id="favicon" href="data:,">
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6d6a64; --line: #e3e0da;
+  --accent: #2f6fdb; --ok: #2e8540; --warn: #b7791f; --bad: #c0392b; --code: #f1efea;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1e1e1c; --ink: #ecebe7; --muted: #9b978f; --line: #2f2e2b;
+    --accent: #6ea0ff; --ok: #5cbf73; --warn: #e0a84a; --bad: #ef6b5b; --code: #191917;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --panel: #1e1e1c; --ink: #ecebe7; --muted: #9b978f; --line: #2f2e2b;
+  --accent: #6ea0ff; --ok: #5cbf73; --warn: #e0a84a; --bad: #ef6b5b; --code: #191917;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 18px; }
+h1 { font-size: 22px; margin: 0; }
+a { color: var(--accent); }
+.sub { color: var(--muted); font-size: 13px; }
+.proj { font-weight: 600; }
+.tag { font-size: 12px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); white-space: nowrap; }
+.tag.failed, .tag.lost { color: var(--bad); } .tag.running, .tag.granted { color: var(--accent); } .tag.cancelled, .tag.paused { color: var(--muted); }
+.empty { color: var(--muted); padding: 14px 16px; background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
+button { font: inherit; font-size: 13px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 7px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+.item { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 14px; }
+.media { background: #111; border-radius: 6px; display: flex; justify-content: center; align-items: center; min-height: 120px; }
+.media img { display: block; max-width: 100%; max-height: 72vh; object-fit: contain; }
+.media video { display: block; width: 100%; max-height: 72vh; background: #000; border-radius: 6px; }
+.media.note { background: var(--code); color: var(--muted); font-size: 13px; padding: 24px; text-align: center; flex-direction: column; gap: 10px; }
+.meta { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; margin-top: 8px; }
+.meta .what { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; min-width: 0; }
+.meta .path { font: 12px ui-monospace, Menlo, monospace; color: var(--muted); word-break: break-all; }
+.copy { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; flex: none; }
+.copy svg { width: 14px; height: 14px; }
+.acts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center; }
+.seq input[type=range] { width: 100%; margin: 8px 0 0; }
+.seq .step { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+#more { display: block; margin: 8px auto 0; }
+#toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 40; background: var(--ink); color: var(--bg);
+  padding: 7px 14px; border-radius: 8px; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Outputs</h1>
+      <div class="sub" id="state">loading…</div>
+    </div>
+    <a href="/">Render queue</a>
+  </header>
+  <div id="feed"></div>
+  <button id="more" hidden>Show older</button>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+const $ = id => document.getElementById(id);
+(() => {  // the status page's movie camera, in color
+  const reel = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.2" fill="#e8e6e1"/><circle cx="${cx}" cy="${cy}" r="1.4" fill="#1d1c1a"/>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#1d1c1a"/>
+    ${reel(9, 9.5)}${reel(19.5, 9.5)}<rect x="4" y="15.5" width="18" height="10.5" rx="2" fill="#e8e6e1"/>
+    <path d="M22 19.2 28.5 16v9.5L22 22.3z" fill="#3987e5"/></svg>`;
+  $("favicon").setAttribute("href", "data:image/svg+xml," + encodeURIComponent(svg));
+})();
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const t = ts => new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false});
+const day = ts => { const d = new Date(ts * 1000);
+  return d.toDateString() === new Date().toDateString() ? t(ts) : d.toLocaleDateString([], {weekday: "short"}) + " " + t(ts); };
+const size = b => b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? Math.round(b / 1e3) + " KB" : b + " B";
+const toast = text => { const el = $("toast"); el.textContent = text; el.style.display = "block";
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => el.style.display = "none", 2000); };
+const COPY_ICON = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+  <rect x="5.5" y="5.5" width="8" height="8.5" rx="1.5"/><path d="M10.5 3.5V3a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v6.5A1.5 1.5 0 0 0 4 11h.5"/></svg>`;
+
+const PAGE = 100;  // cards shown at first, and how many more "Show older" adds
+let limit = PAGE;
+const sheets = new Map();  // job id -> what /api/job said of it (a job that ended is asked once)
+const cards = new Map();   // item id -> its card on the page
+
+const fileUrl = (job, a, frame) => `/api/file/${encodeURIComponent(job.id)}/${a.key}${frame != null ? "/" + frame : ""}?v=${Math.round(a.mtime)}`;
+const frameAt = (a, i) => { for (const [lo, hi] of a.frames) { if (i <= hi - lo) return lo + i; i -= hi - lo + 1; } return a.frames[a.frames.length - 1][1]; };
+const frameName = (a, f) => a.prefix + (a.width ? String(f).padStart(a.width, "0") : String(f)) + a.suffix;
+const pathOf = (a, name) => (a.dir && a.dir !== "." ? a.dir + "/" : "") + (name || a.name);
+
+async function onMac(how, job, a) {
+  try {
+    const r = await fetch(`/api/${how}/${encodeURIComponent(job.id)}/${a.key}`, {method: "POST"});
+    toast(r.ok ? (how === "open" ? "Opened on the Mac" : "Shown in the Finder") : "It isn't there any more");
+  } catch (e) { toast("The status page is offline"); }
+}
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch (e) {  // (an older browser, or one that refuses without a click it counts)
+    const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); ta.remove();
+  }
+  toast("Copied: " + text);
+}
+
+// a file this browser can't show: what it is, and the Mac's buttons instead
+function noteMedia(card, text) {
+  const m = card.querySelector(".media");
+  m.className = "media note";
+  m.innerHTML = `<div>${esc(text)}</div><div class="acts"><button data-mac="open">Open on Mac</button><button data-mac="reveal">Show in Finder</button></div>`;
+}
+
+function mediaHtml(it) {
+  const {job, a} = it;
+  if (!a.browser) return `<div class="media"></div>`;
+  if (a.kind === "image") return `<div class="media"><a href="${fileUrl(job, a)}" target="_blank" rel="noopener" title="Open the full file in a new tab"><img loading="lazy" decoding="async" src="${fileUrl(job, a)}" alt="${esc(a.name)}"></a></div>`;
+  if (a.kind === "video") return `<div class="media"><video controls preload="none" playsinline src="${fileUrl(job, a)}"></video></div>`;
+  const first = a.frames[0][0];
+  return `<div class="seq"><div class="media"><img alt="" src="${fileUrl(job, a, first)}"></div>
+    <input type="range" min="0" max="${a.count - 1}" value="0" aria-label="Frame">
+    <div class="step"><button data-step="-1" aria-label="Previous frame">‹</button><button data-step="1" aria-label="Next frame">›</button>
+      <span class="sub" data-label>${esc(frameName(a, first))} · 1 of ${a.count}</span></div></div>`;
+}
+
+function buildCard(it) {
+  const job = it.job;
+  let a = it.a;
+  const card = document.createElement("div");
+  card.className = "item";
+  const status = job.finished ? (job.status === "done" ? "" : job.status) : job.status === "queued" ? "paused" : "running";
+  const extra = a.kind === "sequence" ? ` · ${a.count} frames` : "";
+  card.innerHTML = `${mediaHtml(it)}
+    <div class="meta"><div class="what"><span class="proj">${esc(job.project)}</span><span>${esc(job.name)}</span>
+      ${status ? `<span class="tag ${esc(status)}">${esc(status)}${job.exit && job.status === "failed" ? " " + job.exit : ""}</span>` : ""}
+      <span class="sub" data-info>${day(a.mtime)} · ${size(a.size)}${extra}</span>
+      <span class="path" data-path>${esc(pathOf(a))}</span></div>
+      <button class="copy" title="Copy the job, file and job id, to tell the session about it" aria-label="Copy job and file name">${COPY_ICON}Copy</button></div>`;
+  let frame = a.kind === "sequence" ? a.frames[0][0] : null;
+  const name = () => frame == null ? pathOf(a) : pathOf(a, frameName(a, frame));
+  card.querySelector(".copy").addEventListener("click", () => copy(`${job.name} - ${name()} (job ${job.id})`));
+  card.addEventListener("click", e => { const b = e.target.closest("[data-mac]"); if (b) onMac(b.dataset.mac, job, a); });
+  if (!a.browser) noteMedia(card, `${a.ext.slice(1).toUpperCase()}: browsers can't show ${a.kind === "sequence" ? "these frames" : "this file"}`);
+  else if (a.kind === "image") {
+    const img = card.querySelector("img");
+    img.addEventListener("error", () => noteMedia(card, `${a.ext.slice(1).toUpperCase()}: this browser can't show it, or it is gone`));
+  } else if (a.kind === "video") {
+    const v = card.querySelector("video");
+    const fail = () => noteMedia(card, "This browser can't play this video, or it is gone");
+    v.addEventListener("error", fail);
+    v.addEventListener("loadedmetadata", () => { if (!v.videoWidth) fail(); });
+    seen.observe(v);
+  } else {
+    const img = card.querySelector("img"), range = card.querySelector("input"), label = card.querySelector("[data-label]");
+    let want = 0, loading = false, shown = false;
+    img.onload = () => { shown = true; };
+    img.onerror = () => { if (!shown) noteMedia(card, `${a.ext.slice(1).toUpperCase()}: this browser can't show these frames, or they are gone`); };
+    const show = () => { if (loading || !shown) return; loading = true; const i = want, f = frameAt(a, i);
+      img.src = fileUrl(job, a, f); frame = f;
+      label.textContent = `${frameName(a, f)} · ${i + 1} of ${a.count}`;
+      card.querySelector("[data-path]").textContent = name();
+      const done = () => { loading = false; if (want !== i) show(); };
+      img.onload = done; img.onerror = () => { label.textContent = `${frameName(a, f)} is gone`; done(); }; };
+    range.addEventListener("input", () => { want = +range.value; show(); });
+    card.update = na => {  // more frames came in: the same card, a longer scrubber
+      a = na; range.max = a.count - 1;
+      card.querySelector("[data-info]").textContent = `${day(a.mtime)} · ${size(a.size)} · ${a.count} frames`;
+      if (!loading) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count}`; };
+    card.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
+      want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));
+  }
+  return card;
+}
+// a video loads its first frame only once it comes near the screen (many at once stall the page's connections)
+const seen = new IntersectionObserver(es => es.forEach(e => {
+  if (e.isIntersecting) { e.target.preload = "metadata"; seen.unobserve(e.target); } }), {rootMargin: "400px"});
+
+// what the feed shows: each file once, under the job that ran when it was written (a declared folder also holds
+// what earlier work wrote there), the newest first
+function items(jobs, now) {
+  const out = new Map();
+  for (const job of jobs) {
+    const s = sheets.get(job.id);
+    if (!s || !s.artifacts) continue;
+    const from = job.started - 2, to = (job.finished || now) + 2;
+    for (const a of s.artifacts) {
+      if (a.mtime < from || a.mtime > to) continue;
+      const where = pathOf(a);
+      if (out.has(where)) continue;
+      // a sequence keeps its card while frames come in; a file written again is a new card
+      const id = `${job.id}|${a.key}` + (a.kind === "sequence" ? "" : `|${Math.round(a.mtime)}`);
+      out.set(where, {id, job, a});
+    }
+  }
+  return [...out.values()].sort((x, y) => y.a.mtime - x.a.mtime);
+}
+
+function render(list) {
+  const shown = list.slice(0, limit), want = new Set(shown.map(it => it.id));
+  for (const [id, card] of cards) if (!want.has(id)) {
+    card.querySelectorAll("video").forEach(v => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch (e) {} });
+    card.remove(); cards.delete(id);
+  }
+  let prev = null;  // keep the order without rebuilding cards that are there (a playing video stays as it is)
+  for (const it of shown) {
+    let card = cards.get(it.id);
+    if (!card) { card = buildCard(it); cards.set(it.id, card); }
+    else if (card.update && card.count !== it.a.count) card.update(it.a);
+    card.count = it.a.count;
+    const next = prev ? prev.nextSibling : $("feed").firstChild;
+    if (card !== next) $("feed").insertBefore(card, next);
+    prev = card;
+  }
+  $("more").hidden = list.length <= limit;
+  if (!list.length) $("feed").innerHTML = `<div class="empty">No job wrote pictures or videos to its declared outputs in the last 24 hours.</div>`;
+  else { const e = $("feed").querySelector(".empty"); if (e) e.remove(); }
+}
+
+let last = [];
+async function poll() {
+  let f;
+  try { f = await (await fetch("/api/feed", {cache: "no-store"})).json(); }
+  catch (e) { $("state").textContent = "the status page is offline"; return; }
+  const need = f.jobs.filter(j => !j.finished || !sheets.has(j.id));
+  let i = 0;
+  await Promise.all([0, 1, 2, 3].map(async () => {
+    while (i < need.length) {
+      const j = need[i++];
+      try { const r = await fetch("/api/job/" + encodeURIComponent(j.id), {cache: "no-store"}); if (r.ok) sheets.set(j.id, await r.json()); }
+      catch (e) {}
+    }
+  }));
+  const ids = new Set(f.jobs.map(j => j.id));
+  for (const id of sheets.keys()) if (!ids.has(id)) sheets.delete(id);
+  last = items(f.jobs, f.now);
+  render(last);
+  const running = f.jobs.filter(j => !j.finished).length;
+  $("state").textContent = `${last.length} file${last.length === 1 ? "" : "s"} from ${f.jobs.length} jobs of the last 24 hours`
+    + (running ? ` · ${running} running, its files show as they are written` : "") + ` · newest first`;
+}
+$("more").addEventListener("click", () => { limit += PAGE; render(last); });
+
+(async function loop() { await poll(); setTimeout(loop, 5000); })();
+</script>
+</body>
+</html>

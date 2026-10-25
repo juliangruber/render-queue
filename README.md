@@ -293,6 +293,12 @@ may wait for your permission, or its turn ended while its jobs are unwatched or 
 light ends (not when it was cancelled; click to open its sheet) and when a session shows up under "Waiting for you"
 (click to open the session, if `sessions.json` has a link for it).
 
+**Outputs** (http://localhost:8642/feed, linked next to the title) shows every picture, video and frame sequence the
+jobs of the last 24 hours wrote, the newest first, one under the other at full width, to catch a bug early by looking.
+A file shows once, under the job that ran when it was written (a declared folder also holds what earlier work wrote
+there); a running job's files show as they are written. Under each: the session, the job, when, and a Copy button
+that copies `<job name> - <path> (job <id>)` (for a sequence, the frame on screen) to tell that session about it.
+
 Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what is at the outputs it declared:
 
 - First the outputs themselves, one line each: a file (or "not there"), a folder with what it holds, a frame
@@ -387,7 +393,7 @@ running meanwhile.
 
 ## Updating rq
 
-Copy `rq`, `status.html` and `render-session-rules.md` together (the rules describe what that `rq` does), then have
+Copy `rq`, `status.html`, `feed.html` and `render-session-rules.md` together (the rules describe what that `rq` does), then have
 the queue session restart the dispatcher (`kill` the pid in `state/dispatcher.json`, then `rq start`): jobs keep
 running meanwhile. `rq run` refuses to queue while an older dispatcher runs. Jobs whose `rq run` is older run as
 before until they end. Then tell the render sessions that the render-queue rules changed. Since rq has

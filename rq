@@ -1868,6 +1868,20 @@ def listed_item(job, key):
         return (_listings.get(job["id"]) or (0, {}))[1].get(key)
 
 
+FEED_HOURS = 24  # how far back the outputs page looks
+FEED_JOBS = 80  # at most this many jobs on it
+
+
+def feed_jobs():
+    """The jobs the outputs page shows what they wrote: started in the last FEED_HOURS with outputs declared,
+    the newest first (running ones on top)."""
+    now = time.time()
+    jobs = [j for j in all_jobs() if j.get("outputs") and j.get("started") and now - j["started"] < FEED_HOURS * 3600]
+    jobs.sort(key=lambda j: j.get("finished") or now, reverse=True)
+    return [{k: j.get(k) for k in ("id", "project", "name", "kind", "status", "started", "finished", "exit")}
+            for j in jobs[:FEED_JOBS]]
+
+
 def job_sheet(job):
     """A job's sheet for the page: what is at its declared outputs now, without absolute paths."""
     listing = remember_listing(job) if job.get("outputs") else {"outputs": [], "items": [], "truncated": 0,
@@ -3603,9 +3617,11 @@ class Page(BaseHTTPRequestHandler):
         if not self.local_host():
             return self.send("forbidden", "text/plain", 403)
         path = self.path.split("?")[0]
-        if path == "/":
-            with open(os.path.join(HOME, "status.html")) as f:
+        if path in ("/", "/feed"):
+            with open(os.path.join(HOME, "status.html" if path == "/" else "feed.html")) as f:
                 return self.send(f.read())
+        if path == "/api/feed":
+            return self.send(json.dumps({"now": time.time(), "jobs": feed_jobs()}), "application/json")
         if path == "/api/status":
             return self.send(json.dumps(snapshot()), "application/json")
         m = re.match(r"^/api/job/([A-Za-z0-9_.-]+)$", path)
