@@ -2707,12 +2707,26 @@ def owner_done(job):
     return (job.get("v") or 1) < 2 and job["status"] in TERMINAL and time.time() - (job.get("finished") or 0) > 2
 
 
-def watch(job_id, offset=0, seen=b"", pending=None):
+def register_watch(job_id):
+    """This process watches job_id from now on: its watch file, flocked for as long as the returned fd is open."""
+    info = {"pid": os.getpid(), "claude_pid": claude_pid(), "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or None, "task_output": output_path(), "since": time.time()}
+    info["claude_start"] = proc_start(info["claude_pid"])
+    path = os.path.join(WATCH, "%s.%d.json" % (job_id, os.getpid()))
+    fd = os.open(path + ".tmp", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # locked before it has its name, and for as long as this process watches
+    os.write(fd, json.dumps(info).encode())
+    os.rename(path + ".tmp", path)
+    return path, fd, info
+
+
+def watch(job_id, offset=0, seen=b"", pending=None, side=None, rest=None):
     """Follow a job: its place in the queue while it waits, then its output from the log, until its owner has
     recorded the end; then exit with its exit code. It only watches: stopping it (TaskStop, a timeout, its session
     or the app ending) leaves the job and its record alone. It registers in state/watch, so the job counts as
     watched, and it ends by itself once the Claude Code session it reports to is gone. pending: a signal rq run
-    got while it submitted the job."""
+    got while it submitted the job. side(emit): called on every check (rq wait with several jobs: the others that
+    ended meanwhile); rest(): the other jobs this process watches, for its last lines when it is stopped."""
     log_path = os.path.join(LOGS, job_id + ".log")
     ctx = {"path": None, "info": None, "pos": offset}
 
@@ -2736,6 +2750,13 @@ def watch(job_id, offset=0, seen=b"", pending=None):
                 code = exit_code(job)
             else:
                 os.write(1, ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), stopped_line(job))).encode())
+            for other in (rest() if rest else []):
+                job = load_job(other) or {"id": other}
+                ended = job.get("status") in TERMINAL
+                os.write(1, ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"),
+                                               result_line(job) if ended else stopped_line(job))).encode())
+                if ended and ctx["info"]:
+                    collect(other, ctx["info"])
         except Exception:
             pass
         os._exit(code)
@@ -2744,14 +2765,7 @@ def watch(job_id, offset=0, seen=b"", pending=None):
     if pending and pending.get("signal"):  # (it came after rq run last looked)
         stopped(pending["signal"], None)
 
-    info = {"pid": os.getpid(), "claude_pid": claude_pid(), "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")
-            or None, "task_output": output_path(), "since": time.time()}
-    info["claude_start"] = proc_start(info["claude_pid"])
-    path = os.path.join(WATCH, "%s.%d.json" % (job_id, os.getpid()))
-    fd = os.open(path + ".tmp", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX)  # locked before it has its name, and for as long as this process watches
-    os.write(fd, json.dumps(info).encode())
-    os.rename(path + ".tmp", path)
+    path, fd, info = register_watch(job_id)
     ctx.update(path=path, info=info)
 
     def emit(data):
@@ -2814,25 +2828,95 @@ def watch(job_id, offset=0, seen=b"", pending=None):
         if orphaned:  # the session this task reported to is gone: nobody reads this; the job carries on
             line("the session that started this task is gone: " + stopped_line(job))
             return EXIT_ORPHANED  # (its watch file stays: the supervisor notes the result in this task's output file)
+        if side:
+            side(emit)
         time.sleep(0.5)
 
 
 def cmd_wait(args):
-    """rq wait ID: watch a job again. The last lines of its log, then its output from there; for a job that has
-    ended, its result at once. Never cancels anything."""
-    job = find_job(args.id)
-    path = os.path.join(LOGS, job["id"] + ".log")
+    """rq wait ID...: watch jobs again. The last lines of a job's log, then its output from there; for a job that
+    has ended, its result at once. Never cancels anything."""
+    jobs = []
+    for prefix in args.ids:
+        job = find_job(prefix)
+        if job["id"] not in (j["id"] for j in jobs):
+            jobs.append(job)
+    if len(jobs) == 1:
+        return wait_one(jobs[0]["id"], args.n)
+    return wait_many([j["id"] for j in jobs], args.n)
+
+
+def wait_one(job_id, n, side=None, rest=None):
+    path = os.path.join(LOGS, job_id + ".log")
     try:
         size = os.path.getsize(path)
     except OSError:
         size = 0
-    tail = log_tail(path, args.n, size).encode()
+    tail = log_tail(path, n, size).encode()
     if tail:
         try:
             os.write(1, tail)
         except OSError:
             return EXIT_NO_OUTPUT
-    return watch(job["id"], offset=size, seen=tail)
+    return watch(job_id, offset=size, seen=tail, side=side, rest=rest)
+
+
+def wait_many(ids, n):
+    """rq wait with several jobs: all of them count as watched from the start. It follows one at a time (one that
+    has ended, then the running ones, then the queue's order); one that ends meanwhile shows its last lines and
+    result at once. Exits with the first non-zero code in the order given, else 0."""
+    held = {jid: register_watch(jid) for jid in ids}
+    codes, current = {}, [None]
+
+    def release(jid):
+        path, fd, _ = held.pop(jid, (None, None, None))
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            os.close(fd)
+
+    def stamp(text):
+        return ("[rq %s] %s\n" % (time.strftime("%H:%M:%S"), text)).encode()
+
+    def side(emit):
+        for jid in list(held):
+            if jid == current[0]:
+                continue
+            job = load_job(jid)
+            if not job or job["status"] not in TERMINAL or not owner_done(job):
+                continue
+            tail = log_tail(os.path.join(LOGS, jid + ".log"), n).encode()
+            text = result_line(job)
+            emit(stamp("%s ended while this task followed %s; its last lines:" % (jid, current[0])) + tail
+                 + (b"" if text.encode() in tail else stamp(text)))  # (the supervisor logs it; the dispatcher doesn't)
+            collect(jid, held[jid][2])
+            codes[jid] = exit_code(job)
+            release(jid)
+
+    def rank(jid, place):
+        job = load_job(jid) or {}
+        if job.get("status") in TERMINAL or not job:
+            return (0, 0)
+        if job.get("status") != "queued":
+            return (1, job.get("started") or job.get("granted") or 0)
+        return (2, place.get(jid, len(place)))
+
+    while held:
+        queued = [j for j in (load_job(i) for i in held) if j and j.get("status") == "queued"]
+        place = {j["id"]: k for k, j in enumerate(queue_order(queued))}
+        jid = min(held, key=lambda i: rank(i, place))
+        current[0] = jid
+        os.write(1, stamp("following %s (%d of %d)" % (jid, len(codes) + 1, len(ids))))
+        code = wait_one(jid, n, side=side, rest=lambda: [i for i in held if i != current[0]])
+        codes[jid] = code
+        release(jid)
+        if code in (EXIT_ORPHANED, EXIT_NO_OUTPUT):
+            return code
+    os.write(1, stamp("all %d jobs ended: %s" % (len(ids), ", ".join(
+        "%s %s" % (i, "done" if codes[i] == 0 else "exit %d" % codes[i]) for i in ids))))
+    return next((codes[i] for i in ids if codes[i]), 0)
 
 
 def recent_jobs(days):
@@ -3627,8 +3711,9 @@ def main():
         again.add_argument("--replace", action="store_true",
                            help="first cancel this project's jobs with this name that are still queued or running")
         r.add_argument("command", nargs=argparse.REMAINDER)
-    w = sub.add_parser("wait", help="watch a job again: its output from here, then its exit code (never cancels)")
-    w.add_argument("id")
+    w = sub.add_parser("wait", help="watch jobs again: their output from here, then their exit code (never cancels); "
+                                    "with several IDs, all count as watched at once")
+    w.add_argument("ids", nargs="+", metavar="ID")
     w.add_argument("-n", type=int, default=20, help="log lines to show first (default 20)")
     mine = sub.add_parser("mine", help="this session's jobs that no task of it watches, and results that didn't "
                                        "reach it")

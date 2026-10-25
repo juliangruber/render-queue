@@ -199,7 +199,9 @@ prompt, it tells the session which of its jobs no task watches and which results
   symlink in the projects folder). It is one folder name in the projects folder.
 - Stopping the `rq run` process (or the background task running it) only stops watching: the job carries on,
   queued or running, and so it does when its session or the app ends or you switch accounts. `rq cancel ID`
-  cancels it; `rq wait ID` watches it again, and for a job that has ended, it reports the result at once. A
+  cancels it; `rq wait ID` watches it again, and for a job that has ended, it reports the result at once.
+  `rq wait ID1 ID2 ...` watches several jobs at once (all count as watched from the start): it follows them one at
+  a time, shows one that ends meanwhile right away, and exits with the first non-zero code in the order given. A
   stopped task's output file gets a note that the job carries on, and later its result. The status page and
   `rq status` mark a job that no task of its session watches "unwatched", and a result that hasn't reached that
   session "unseen".
@@ -243,7 +245,8 @@ rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [
                              (--output PATH, -o PATH: a file, a folder/ or a frame pattern like 'renders/####.png'
                              the job writes, repeated for several; --no-output: it writes no pictures or videos;
                              every rq run and rq light needs one of them, before -- COMMAND)
-rq wait ID [-n 20]           (watch a job again: its output from here and its exit code; at once if it ended)
+rq wait ID... [-n 20]        (watch jobs again: their output from here and their exit codes; at once if ended;
+                             several IDs count as watched at once, the first non-zero code is the exit code)
 rq mine [--unwatched] [--hook]   (this session's jobs no task of it watches, results that didn't reach it)
 rq status [--json]           (also: jobs nobody watches, results nobody has seen, with their ids)
 rq log ID [-n 40] [-f]

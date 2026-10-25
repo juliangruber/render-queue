@@ -41,9 +41,13 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   job. To cancel a job on purpose: `rq cancel ID`. To replace one: `rq run --replace ...` (it cancels this
   project's jobs with the same name first), or `rq cancel ID` and then submit.
 - If you wait for a job but have no rq task running for it (after a restart or account switch, or for a job a
-  subagent queued), run `rq mine --unwatched` and start `rq wait ID` as a background task for each job it lists.
+  subagent queued), run `rq mine --unwatched` and start `rq wait ID` as a background task for the jobs it lists.
   It shows the output from there and exits with the job's exit code; for a finished job it reports the result at
-  once. Don't resubmit a job that is queued, running or done (check `rq mine` first). rq refuses a resubmit with
+  once.
+- To wait for several jobs (a batch queued with `--detach`), start one background task `rq wait ID1 ID2 ...`, never
+  a loop of `rq wait`s: every job counts as watched from the start (a loop watches only the current one, so the
+  others show "unwatched"). It follows them one at a time, shows a job that ends meanwhile at once, ends with a line
+  of all results and exits with the first non-zero code in the order given (0 if all are done). Don't resubmit a job that is queued, running or done (check `rq mine` first). rq refuses a resubmit with
   the same name, folder and command while the old one is still queued or running and no task of yours watches it
   (exit 65; if you resubmitted it to correct its `--output`s, the queued job takes them), and warns about one from
   another folder; it never refuses a finished one.
