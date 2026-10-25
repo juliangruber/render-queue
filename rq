@@ -1155,8 +1155,8 @@ def last_turn(path):
             entry = json.loads(line)
         except ValueError:
             continue
-        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain"):
-            continue
+        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain") or entry.get("isCompactSummary"):
+            continue  # (a compaction's summary is no prompt: the session hasn't started a turn)
         last = entry
         content = (entry.get("message") or {}).get("content")
         prompt = entry["type"] == "user" and not (isinstance(content, list) and any(

@@ -264,7 +264,6 @@ function showWaiting(sessions) {
   if (!sessions || !sessions.length) { $("waiting").innerHTML = ""; return; }  // no session watched (state/sessions.json)
   const now = Date.now() / 1000;
   const waiting = sessions.filter(needsYou).sort((a, b) => (a.since || 0) - (b.since || 0));
-  const working = sessions.filter(x => x.state === "working").map(x => x.project);
   const name = x => x.link ? `<a href="${esc(x.link)}" class="proj">${esc(x.project)}</a>` : `<span class="proj">${esc(x.project)}</span>`;
   // what the session may not know: its project's jobs that no task watches (they won't wake it), results nobody has seen
   const noteText = n => n.unwatched ? `${n.name} ${n.what}, ${n.elsewhere ? "no task of this session watches it" : "nobody watches it"}`
@@ -276,8 +275,7 @@ function showWaiting(sessions) {
       <td>${x.state === "waiting" ? WAIT_LABEL[x.state] : `<span class="tag paused">${WAIT_LABEL[x.state]}${x.tool ? " · " + esc(x.tool) : ""}</span>`}${notes(x)}</td>
       <td class="num">${x.since ? day(x.since) + ` <span class="sub">(${dur(now - x.since)})</span>` : "?"}</td>
       <td class="hide-sm sub">${x.background ? x.background + " task" + (x.background > 1 ? "s" : "") + " running" : ""}</td></tr>`).join("")}</table>`
-    : `<div class="empty">No session needs you.</div>`}
-    ${working.length ? `<div class="sub" style="margin-top:8px">Working: ${working.map(esc).join(", ")}</div>` : ""}`;
+    : `<div class="empty">No session needs you.</div>`}`;
 }
 
 function showGpu(g) {
