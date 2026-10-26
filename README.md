@@ -308,9 +308,14 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
   folder 24 or more numbered pictures in one folder are one. In a folder the sheet looks 4 folders deep, at up to
   20000 files and folders, and shows up to 500 single pictures and videos (it says when there is more); declared
   files and frame patterns always show, ahead of what declared folders hold.
-- What the browser can't show (EXR always; ProRes outside Safari, TIFF outside Safari) isn't converted: the page
-  offers **Open on Mac** (opens the file in its usual app) and **Show in Finder** instead. A whole sequence opens as
-  its folder; a folder that is a package (an `.app` or another bundle) is only shown in the Finder, never opened.
+- **EXR** pictures and frames show as JPEGs in sRGB, converted when the page first asks for one (with `sips`,
+  as Preview shows them: linear light to sRGB, highlights above 1.0 clipped) and labelled "shown as JPEG". The
+  JPEGs are kept in `state/previews/` (the 3000 shown most recently), by file, size and change time, so a
+  rewritten EXR gets a new one; at most 2 conversions run at once, at nice 10.
+- Other files the browser can't show (ProRes outside Safari, TIFF outside Safari, an EXR `sips` can't read) aren't
+  converted: the page offers **Open on Mac** (opens the file in its usual app) and **Show in Finder** instead. A
+  whole sequence opens as its folder; a folder that is a package (an `.app` or another bundle) is only shown in the
+  Finder, never opened.
 - The sheet shows what is at the declared paths when you open it: files written there after the job ended show up
   too, and files removed since don't. A job that never ran (cancelled before it started, or still queued) says
   that what shows was written by other work. A job queued with `--no-output` says it writes no pictures or videos;

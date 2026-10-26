@@ -1322,7 +1322,12 @@ def session_states(found=None):
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".bmp", ".tif", ".tiff", ".heic", ".exr"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 MEDIA_EXT = IMAGE_EXT | VIDEO_EXT
-NO_BROWSER_EXT = {".exr"}  # no browser shows these: the page offers to open them on the Mac instead
+NO_BROWSER_EXT = set()  # no browser shows these, and rq can't convert them: the page offers the Mac's apps instead
+PREVIEW_EXT = {".exr"}  # the page shows these as JPEGs in sRGB, converted the way Preview shows them (sips)
+PREVIEWS = os.path.join(STATE, "previews")  # the converted JPEGs, by file, size and change time
+PREVIEW_KEEP = 3000  # JPEGs kept there at most; the least recently shown go first
+PREVIEW_JOBS = threading.Semaphore(2)  # conversions at once
+SRGB_ICC = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".cache", ".mypy_cache", ".pytest_cache"}
 SCRATCH_GLOB = os.environ.get("RQ_SCRATCH_GLOB", "/private/tmp/claude-%d/" % os.getuid())  # this user's scratchpads
 MAX_SINGLES = 500  # single pictures and videos a sheet shows of declared folders (declared files and sequences: all)
@@ -1890,7 +1895,7 @@ def job_sheet(job):
     for item in listing["items"]:
         ext = ext_of(item["name"] if item["kind"] == "sequence" else item["real"])
         view = dict(key=item["key"], kind=item["kind"], size=item["size"], mtime=item["mtime"], ext=ext,
-                    browser=ext not in NO_BROWSER_EXT)
+                    browser=ext not in NO_BROWSER_EXT, preview=ext in PREVIEW_EXT)
         if item["kind"] == "sequence":
             view.update(name=item["name"], dir=display_path(item["dir"], job["project"]), frames=item["frames"],
                         count=item["count"], width=item["width"], prefix=item["prefix"], suffix=item["suffix"])
@@ -3568,6 +3573,49 @@ def cmd_status(args):
 
 # ---------- status page ----------
 
+def preview_jpeg(path):
+    """A JPEG of a picture no browser shows (EXR), in sRGB: from the cache, or converted now. None if it fails."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    real = os.path.realpath(path)
+    name = hashlib.sha1(("%s|%d|%d" % (real, st.st_size, st.st_mtime_ns)).encode()).hexdigest() + ".jpg"
+    out = os.path.join(PREVIEWS, name)
+    if os.path.exists(out):
+        with contextlib.suppress(OSError):
+            os.utime(out)  # recently shown: kept longer
+        return out
+    with PREVIEW_JOBS:
+        if not os.path.exists(out):  # (unless another request converted it meanwhile)
+            os.makedirs(PREVIEWS, exist_ok=True)
+            tmp = "%s.%d.%d.jpg" % (out[:-4], os.getpid(), threading.get_ident())
+            try:
+                subprocess.run(["nice", "-n", "10", "sips", "-m", SRGB_ICC, "-s", "format", "jpeg",
+                                "-s", "formatOptions", "90", real, "--out", tmp],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+                os.replace(tmp, out)
+            except (OSError, subprocess.SubprocessError):
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                return None
+            prune_previews()
+    return out
+
+
+def prune_previews():
+    try:
+        names = [e for e in os.scandir(PREVIEWS) if e.name.endswith(".jpg")]
+    except OSError:
+        return
+    if len(names) <= PREVIEW_KEEP:
+        return
+    names.sort(key=lambda e: e.stat().st_mtime if os.path.exists(e.path) else 0)
+    for e in names[:len(names) - PREVIEW_KEEP]:
+        with contextlib.suppress(OSError):
+            os.unlink(e.path)
+
+
 class Page(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # keep-alive and ranges, which video players rely on
     timeout = 120  # idle kept-alive connections end instead of holding a thread forever
@@ -3634,6 +3682,9 @@ class Page(BaseHTTPRequestHandler):
             target = self.target(path[len("/api/file/"):])
             if not target or os.path.isdir(target):
                 return self.send("not found", "text/plain", 404)
+            if ext_of(target) in PREVIEW_EXT:
+                jpeg = preview_jpeg(target)
+                return self.send_file(jpeg) if jpeg else self.send("can't convert this file", "text/plain", 415)
             return self.send_file(target)
         self.send("not found", "text/plain", 404)
 

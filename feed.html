@@ -139,7 +139,7 @@ function buildCard(it) {
   card.innerHTML = `${mediaHtml(it)}
     <div class="meta"><div class="what"><span class="proj">${esc(job.project)}</span><span>${esc(job.name)}</span>
       ${status ? `<span class="tag ${esc(status)}">${esc(status)}${job.exit && job.status === "failed" ? " " + job.exit : ""}</span>` : ""}
-      <span class="sub" data-info>${day(a.mtime)} · ${size(a.size)}${extra}</span>
+      <span class="sub" data-info>${day(a.mtime)} · ${size(a.size)}${extra}${a.preview ? " · shown as JPEG" : ""}</span>
       <span class="path" data-path>${esc(pathOf(a))}</span></div>
       <button class="copy" title="Copy the job, file and job id, to tell the session about it" aria-label="Copy job and file name">${COPY_ICON}Copy</button></div>`;
   let frame = a.kind === "sequence" ? a.frames[0][0] : null;
@@ -170,7 +170,7 @@ function buildCard(it) {
     range.addEventListener("input", () => { want = +range.value; show(); });
     card.update = na => {  // more frames came in: the same card, a longer scrubber
       a = na; range.max = a.count - 1;
-      card.querySelector("[data-info]").textContent = `${day(a.mtime)} · ${size(a.size)} · ${a.count} frames`;
+      card.querySelector("[data-info]").textContent = `${day(a.mtime)} · ${size(a.size)} · ${a.count} frames${a.preview ? " · shown as JPEG" : ""}`;
       if (!loading) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count}`; };
     card.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
       want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));

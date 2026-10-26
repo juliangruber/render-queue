@@ -527,10 +527,10 @@ function renderSheet(v) {
   if (pictures.length) out += `<h3>Pictures · ${pictures.length}</h3><div class="grid">` + pictures.map(a => !a.browser
     ? fileCard(a, `${esc(a.ext.slice(1).toUpperCase())}: browsers can't show this`)
     : `<div class="tile" data-key="${a.key}"><div class="pic" data-lb="${a.key}" tabindex="0" role="button" aria-label="Show ${esc(a.name)} full size"><img loading="lazy" decoding="async" src="${fileUrl(a)}" alt="${esc(a.name)}"></div>
-        <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}</div></div></div>`).join("") + "</div>";
+        <div class="cap"><div class="fname">${esc(a.name)}</div><div class="sub">${esc(a.dir)} · ${size(a.size)}${a.preview ? " · shown as JPEG" : ""}</div></div></div>`).join("") + "</div>";
   if (seqs.length) out += `<h3>Frame sequences · ${seqs.length}</h3>` + seqs.map(a => {
     const first = a.frames[0][0], last = a.frames[a.frames.length - 1][1];
-    const head = `<div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${count(a.count, "frame", "frames")}, ${first} to ${last} · ${size(a.size)}</span></div>`;
+    const head = `<div class="fname">${esc(a.name)}<span class="sub">${esc(a.dir)} · ${count(a.count, "frame", "frames")}, ${first} to ${last} · ${size(a.size)}${a.preview ? " · shown as JPEG" : ""}</span></div>`;
     const folder = `<div class="acts"><button data-mac="open" data-key="${a.key}">Open folder on Mac</button><button data-mac="reveal" data-key="${a.key}">Show in Finder</button></div>`;
     if (!a.browser) return `<div class="seq">${head}<div class="sub" style="margin-top:6px">${esc(a.ext.slice(1).toUpperCase())}: browsers can't show these frames</div>${folder}</div>`;
     return `<div class="seq" data-seq="${a.key}">${head}
