@@ -406,6 +406,9 @@ before until they end. Then tell the render sessions that the render-queue rules
 gets exit 64 and a message that says what to pass. The dispatcher removes `state/artifacts/`, where an older rq kept
 what it guessed jobs produced; those jobs' sheets say no outputs were declared.
 
+Open status and Outputs pages reload themselves when their `.html` file changes (the status page not while a
+picture is shown full size, the Outputs page once it is scrolled back to the top).
+
 ## License
 
 MIT

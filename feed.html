@@ -222,11 +222,14 @@ function render(list) {
   else { const e = $("feed").querySelector(".empty"); if (e) e.remove(); }
 }
 
-let last = [];
+let last = [], pageVersion = null;
 async function poll() {
   let f;
   try { f = await (await fetch("/api/feed", {cache: "no-store"})).json(); }
   catch (e) { $("state").textContent = "the status page is offline"; return; }
+  // rq's page file changed: load the new one, once you're back at the top (a reload would lose the scroll position)
+  if (f.page && pageVersion && f.page !== pageVersion && scrollY < 200) return location.reload();
+  pageVersion = pageVersion || f.page;
   const need = f.jobs.filter(j => !j.finished || !sheets.has(j.id));
   let i = 0;
   await Promise.all([0, 1, 2, 3].map(async () => {

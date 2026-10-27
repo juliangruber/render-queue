@@ -3577,6 +3577,14 @@ def cmd_status(args):
 
 # ---------- status page ----------
 
+def page_version(name):
+    """The page file's change time: an open tab reloads itself when it differs from the one it loaded with."""
+    try:
+        return os.stat(os.path.join(HOME, name)).st_mtime_ns
+    except OSError:
+        return None
+
+
 def preview_jpeg(path):
     """A JPEG of a picture no browser shows (EXR), in sRGB: from the cache, or converted now. None if it fails."""
     try:
@@ -3673,9 +3681,10 @@ class Page(BaseHTTPRequestHandler):
             with open(os.path.join(HOME, "status.html" if path == "/" else "feed.html")) as f:
                 return self.send(f.read())
         if path == "/api/feed":
-            return self.send(json.dumps({"now": time.time(), "jobs": feed_jobs()}), "application/json")
+            return self.send(json.dumps({"now": time.time(), "jobs": feed_jobs(), "page": page_version("feed.html")}),
+                             "application/json")
         if path == "/api/status":
-            return self.send(json.dumps(snapshot()), "application/json")
+            return self.send(json.dumps(dict(snapshot(), page=page_version("status.html"))), "application/json")
         m = re.match(r"^/api/job/([A-Za-z0-9_.-]+)$", path)
         if m:
             job = load_job(m.group(1))

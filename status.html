@@ -360,10 +360,14 @@ const notifyWaiting = sessions => {
   }
 };
 
+let pageVersion = null;
 async function refresh() {
   let s;
   try { s = await (await fetch("/api/status", {cache: "no-store"})).json(); }
   catch (e) { $("dispatcher").innerHTML = '<span class="dot off"></span>status page offline'; return; }
+  // rq's page file changed: load the new one (an open job sheet stays open; not while a picture is shown full size)
+  if (s.page && pageVersion && s.page !== pageVersion && $("lightbox").hidden) return location.reload();
+  pageVersion = pageVersion || s.page;
   const d = s.dispatcher;
   const watched = (d.sessions || []).map(x => x.project);
   (watched.length ? watched : Object.keys((d.usage || {}).projects || {})).sort().forEach(p => SLOTS.includes(p) || SLOTS.push(p));
