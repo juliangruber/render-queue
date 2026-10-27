@@ -887,6 +887,7 @@ def snapshot():
     d = dispatcher_state()
     # while the queue waits for renders outside it, nobody knows when they end, so start times are unknown
     t = None if (not current and d.get("alive") and any(not w.get("low") for w in d.get("warnings", []))) else now
+    known = t  # all done, at the least: the queue's known estimates added up, skipping the jobs without one
     if current:
         exp = expected_duration(current, history)
         started = current.get("resumed") or current.get("started") or now  # a moved job: its estimate is what remains
@@ -895,12 +896,14 @@ def snapshot():
         current["paused"] = has_flag(current["id"], "paused")
         current["eta"] = started + exp if exp else None
         t = max(current["eta"], now) if current["eta"] else None
+        known = t or now
     for job in queued:
         exp = expected_duration(job, history)
         job["expected"] = exp
         job["eta_start"] = t
         t = t + exp if (t and exp) else None
         job["eta"] = t
+        known = known + (exp or 0) if known else None
     finished = sorted([j for j in jobs if j["status"] in TERMINAL], key=lambda j: j.get("finished") or 0,
                       reverse=True)[:25]
     for job in finished:
@@ -908,7 +911,8 @@ def snapshot():
     news = see_jobs(([current] if current else []) + queued + light + light_queued, finished, jobs, d, now)
     return {"now": now, "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
             "light": [public(j) for j in light], "light_queued": [public(j) for j in light_queued],
-            "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now}
+            "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now,
+            "all_done_known": known if (current or queued) else now}
 
 
 PRIVATE = ("submitter", "argv", "command", "cwd", "owner", "outputs", "artifacts")  # session ids, task output

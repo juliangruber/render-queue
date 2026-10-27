@@ -377,7 +377,7 @@ async function refresh() {
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;
-  $("alldone").textContent = busy ? (s.all_done ? `All done ~${day(s.all_done)}` : "All done: unknown (no estimate)") : "Queue empty";
+  $("alldone").textContent = busy ? (s.all_done ? `All done ~${day(s.all_done)}` : s.all_done_known ? `All done ~${day(s.all_done_known)} + ?` : "All done: unknown (no estimate)") : "Queue empty";
 
   const r = s.running;
   const light = s.light || [];
