@@ -37,7 +37,7 @@ button { font: inherit; font-size: 13px; color: var(--ink); background: var(--pa
 button:hover { border-color: var(--muted); }
 .item { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 14px; }
 .media { background: #111; border-radius: 6px; display: flex; justify-content: center; align-items: center; min-height: 120px; }
-.media img { display: block; max-width: 100%; max-height: 72vh; object-fit: contain; }
+.media img { display: block; max-width: 100%; max-height: 72vh; object-fit: contain; background: repeating-conic-gradient(#9a9a9a 0 25%, #767676 0 50%) 0 0 / 16px 16px; }  /* a mid-gray checkerboard behind transparent pictures: black and white on transparent both read */
 .media video { display: block; width: 100%; max-height: 72vh; background: #000; border-radius: 6px; }
 .media.note { background: var(--code); color: var(--muted); font-size: 13px; padding: 24px; text-align: center; flex-direction: column; gap: 10px; }
 .meta { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; margin-top: 8px; }
