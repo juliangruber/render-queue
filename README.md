@@ -289,9 +289,8 @@ The tab's icon, an old movie camera, is in color while a job runs (heavy or ligh
 It gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
 may wait for your permission, or its turn ended while its jobs are unwatched or its results unseen.
 
-"Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a job that isn't
-light ends (not when it was cancelled; click to open its sheet) and when a session shows up under "Waiting for you"
-(click to open the session, if `sessions.json` has a link for it).
+"Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a session shows up
+under "Waiting for you" (click to open the session, if `sessions.json` has a link for it). Jobs ending don't notify.
 
 **Outputs** (http://localhost:8642/feed, linked next to the title) shows every picture, video and frame sequence the
 jobs of the last 24 hours wrote, the newest first, one under the other at full width, to catch a bug early by looking.
