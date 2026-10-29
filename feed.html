@@ -125,7 +125,7 @@ function mediaHtml(it) {
   const first = a.frames[0][0];
   return `<div class="seq"><div class="media"><img alt="" src="${fileUrl(job, a, first)}"></div>
     <input type="range" min="0" max="${a.count - 1}" value="0" aria-label="Frame">
-    <div class="step"><button data-step="-1" aria-label="Previous frame">‹</button><button data-step="1" aria-label="Next frame">›</button>
+    <div class="step"><button data-play title="Play at ${FPS} fps, looping" aria-label="Play">▶</button><button data-step="-1" aria-label="Previous frame">‹</button><button data-step="1" aria-label="Next frame">›</button>
       <span class="sub" data-label>${esc(frameName(a, first))} · 1 of ${a.count}</span></div></div>`;
 }
 
@@ -157,8 +157,8 @@ function buildCard(it) {
     v.addEventListener("loadedmetadata", () => { if (!v.videoWidth) fail(); });
     seen.observe(v);
   } else {
-    const img = card.querySelector("img"), range = card.querySelector("input"), label = card.querySelector("[data-label]");
-    let want = 0, loading = false, shown = false;
+    const range = card.querySelector("input"), label = card.querySelector("[data-label]");
+    let img = card.querySelector("img"), want = 0, loading = false, shown = false;
     img.onload = () => { shown = true; };
     img.onerror = () => { if (!shown) noteMedia(card, `${a.ext.slice(1).toUpperCase()}: this browser can't show these frames, or they are gone`); };
     const show = () => { if (loading || !shown) return; loading = true; const i = want, f = frameAt(a, i);
@@ -167,16 +167,65 @@ function buildCard(it) {
       card.querySelector("[data-path]").textContent = name();
       const done = () => { loading = false; if (want !== i) show(); };
       img.onload = done; img.onerror = () => { label.textContent = `${frameName(a, f)} is gone`; done(); }; };
-    range.addEventListener("input", () => { want = +range.value; show(); });
+    range.addEventListener("input", () => { pause(); want = +range.value; show(); });
     card.update = na => {  // more frames came in: the same card, a longer scrubber
       a = na; range.max = a.count - 1;
       card.querySelector("[data-info]").textContent = `${day(a.mtime)} · ${size(a.size)} · ${a.count} frames${a.preview ? " · shown as JPEG" : ""}`;
       if (!loading) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count}`; };
     card.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
-      want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));
+      pause(); want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));
+    // play: frames are fetched up to AHEAD in advance and shown at FPS; one that isn't loaded yet holds playback
+    const play = card.querySelector("[data-play]"), buf = new Map();  // frame index -> Image, ahead of the shown one
+    let playing = false, last = 0, inflight = 0;
+    const ahead = i => { const d = (i - want + a.count) % a.count; return d > 0 && d <= AHEAD; };
+    const fill = () => {
+      for (let k = 1; k <= AHEAD && inflight < 4; k++) {
+        const i = (want + k) % a.count;
+        if (buf.has(i)) continue;
+        const im = new Image();
+        inflight++;
+        im.onload = im.onerror = () => { inflight--; if (playing) fill(); };
+        im.src = fileUrl(job, a, frameAt(a, i));
+        buf.set(i, im);
+      }
+    };
+    const tick = t => {
+      if (!playing) return;
+      const step = 1000 / FPS;
+      if (t - last >= step - 2) {
+        const i = (want + 1) % a.count, im = buf.get(i);
+        if (im && im.complete) {
+          want = i; range.value = i; frame = frameAt(a, i);
+          if (im.naturalWidth) { im.onload = im.onerror = null; im.alt = ""; img.replaceWith(im); img = im; }  // (no new fetch)
+          label.textContent = `${frameName(a, frame)} · ${i + 1} of ${a.count}${im.naturalWidth ? "" : " is gone"}`;
+          card.querySelector("[data-path]").textContent = name();
+          for (const k of [...buf.keys()]) if (!ahead(k)) buf.delete(k);
+          last = t - last > 2 * step ? t : last + step;  // after a hold: from now, else on the beat
+          fill();
+        } else if (t - last > 500) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count} · loading`;
+      }
+      requestAnimationFrame(tick);
+    };
+    function pause() {
+      if (!playing) return;
+      playing = false; buf.clear(); playingCard = null;
+      play.textContent = "▶"; play.setAttribute("aria-label", "Play");
+    }
+    card.pause = pause;
+    play.addEventListener("click", () => {
+      if (playing) return pause();
+      if (!shown || a.count < 2) return;
+      if (playingCard) playingCard.pause();  // one sequence plays at a time
+      playingCard = card; playing = true; loading = false;
+      img.onload = img.onerror = null;  // (a frame show() asked for must not take over)
+      play.textContent = "❚❚"; play.setAttribute("aria-label", "Pause");
+      last = performance.now(); fill(); requestAnimationFrame(tick);
+    });
   }
   return card;
 }
+const FPS = 24, AHEAD = 48;  // sequence playback: frames per second, and frames fetched in advance
+let playingCard = null;
 // a video loads its first frame only once it comes near the screen (many at once stall the page's connections)
 const seen = new IntersectionObserver(es => es.forEach(e => {
   if (e.isIntersecting) { e.target.preload = "metadata"; seen.unobserve(e.target); } }), {rootMargin: "400px"});
