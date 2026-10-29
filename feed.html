@@ -174,9 +174,10 @@ function buildCard(it) {
       if (!loading) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count}`; };
     card.querySelectorAll("[data-step]").forEach(b => b.addEventListener("click", () => {
       pause(); want = Math.max(0, Math.min(a.count - 1, want + +b.dataset.step)); range.value = want; show(); }));
-    // play: frames are fetched up to AHEAD in advance and shown at FPS; one that isn't loaded yet holds playback
+    // play: first the next AHEAD frames are fetched and decoded, then they show at FPS while more load behind them;
+    // a frame that isn't decoded yet holds playback (a frame shown before it is decoded flashes)
     const play = card.querySelector("[data-play]"), buf = new Map();  // frame index -> Image, ahead of the shown one
-    let playing = false, last = 0, inflight = 0;
+    let playing = false, started = false, last = 0, inflight = 0;
     const ahead = i => { const d = (i - want + a.count) % a.count; return d > 0 && d <= AHEAD; };
     const fill = () => {
       for (let k = 1; k <= AHEAD && inflight < 4; k++) {
@@ -184,7 +185,9 @@ function buildCard(it) {
         if (buf.has(i)) continue;
         const im = new Image();
         inflight++;
-        im.onload = im.onerror = () => { inflight--; if (playing) fill(); };
+        const ready = () => { im.ready = true; inflight--; if (playing) fill(); };
+        im.onload = () => im.decode().catch(() => {}).then(ready);
+        im.onerror = ready;
         im.src = fileUrl(job, a, frameAt(a, i));
         buf.set(i, im);
       }
@@ -192,9 +195,16 @@ function buildCard(it) {
     const tick = t => {
       if (!playing) return;
       const step = 1000 / FPS;
-      if (t - last >= step - 2) {
+      if (!started) {
+        const need = Math.min(AHEAD, a.count - 1);
+        let have = 0;
+        for (let k = 1; k <= need; k++) if (buf.get((want + k) % a.count)?.ready) have++;
+        label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count} · loading ${have} of ${need} frames`;
+        if (have === need) { started = true; last = t - step; }
+      }
+      if (started && t - last >= step - 2) {
         const i = (want + 1) % a.count, im = buf.get(i);
-        if (im && im.complete) {
+        if (im && im.ready) {
           want = i; range.value = i; frame = frameAt(a, i);
           if (im.naturalWidth) { im.onload = im.onerror = null; im.alt = ""; img.replaceWith(im); img = im; }  // (no new fetch)
           label.textContent = `${frameName(a, frame)} · ${i + 1} of ${a.count}${im.naturalWidth ? "" : " is gone"}`;
@@ -208,7 +218,7 @@ function buildCard(it) {
     };
     function pause() {
       if (!playing) return;
-      playing = false; buf.clear(); playingCard = null;
+      playing = started = false; buf.clear(); playingCard = null;
       play.textContent = "▶"; play.setAttribute("aria-label", "Play");
     }
     card.pause = pause;

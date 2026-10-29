@@ -298,7 +298,8 @@ A file shows once, under the job that ran when it was written (a declared folder
 there); a running job's files show as they are written. Under each: the session, the job, when, and a Copy button
 that copies `<job name> - <path> (job <id>)` (for a sequence, the frame on screen) to tell that session about it.
 A frame sequence has a scrubber, frame steps and ▶, which plays it at 24 fps, looping (one sequence at a time;
-it fetches up to 48 frames ahead and holds on a frame that hasn't loaded yet).
+it first loads the next 48 frames, then plays while more load behind them, and holds on a frame that hasn't loaded
+yet).
 
 Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what is at the outputs it declared:
 
