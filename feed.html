@@ -39,13 +39,11 @@ button:hover { border-color: var(--muted); }
 .media { background: #111; border-radius: 6px; display: flex; justify-content: center; align-items: center; min-height: 120px; }
 .media img { display: block; max-width: 100%; max-height: 72vh; object-fit: contain; background: repeating-conic-gradient(#9a9a9a 0 25%, #767676 0 50%) 0 0 / 16px 16px; }  /* a mid-gray checkerboard behind transparent pictures: black and white on transparent both read */
 .media video { display: block; width: 100%; max-height: 72vh; background: #000; border-radius: 6px; }
-.media.note { background: var(--code); color: var(--muted); font-size: 13px; padding: 24px; text-align: center; flex-direction: column; gap: 10px; }
 .meta { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; margin-top: 8px; }
 .meta .what { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; min-width: 0; }
 .meta .path { font: 12px ui-monospace, Menlo, monospace; color: var(--muted); word-break: break-all; }
 .copy { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; flex: none; }
 .copy svg { width: 14px; height: 14px; }
-.acts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center; }
 .seq input[type=range] { width: 100%; margin: 8px 0 0; }
 .seq .step { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
 #more { display: block; margin: 8px auto 0; }
@@ -95,12 +93,6 @@ const frameAt = (a, i) => { for (const [lo, hi] of a.frames) { if (i <= hi - lo)
 const frameName = (a, f) => a.prefix + (a.width ? String(f).padStart(a.width, "0") : String(f)) + a.suffix;
 const pathOf = (a, name) => (a.dir && a.dir !== "." ? a.dir + "/" : "") + (name || a.name);
 
-async function onMac(how, job, a) {
-  try {
-    const r = await fetch(`/api/${how}/${encodeURIComponent(job.id)}/${a.key}`, {method: "POST"});
-    toast(r.ok ? (how === "open" ? "Opened on the Mac" : "Shown in the Finder") : "It isn't there any more");
-  } catch (e) { toast("The status page is offline"); }
-}
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); }
   catch (e) {  // (an older browser, or one that refuses without a click it counts)
@@ -110,16 +102,8 @@ async function copy(text) {
   toast("Copied: " + text);
 }
 
-// a file this browser can't show: what it is, and the Mac's buttons instead
-function noteMedia(card, text) {
-  const m = card.querySelector(".media");
-  m.className = "media note";
-  m.innerHTML = `<div>${esc(text)}</div><div class="acts"><button data-mac="open">Open on Mac</button><button data-mac="reveal">Show in Finder</button></div>`;
-}
-
 function mediaHtml(it) {
   const {job, a} = it;
-  if (!a.browser) return `<div class="media"></div>`;
   if (a.kind === "image") return `<div class="media"><a href="${fileUrl(job, a)}" target="_blank" rel="noopener" title="Open the full file in a new tab"><img loading="lazy" decoding="async" src="${fileUrl(job, a)}" alt="${esc(a.name)}"></a></div>`;
   if (a.kind === "video") return `<div class="media"><video controls preload="none" playsinline src="${fileUrl(job, a)}"></video></div>`;
   const first = a.frames[0][0];
@@ -145,14 +129,13 @@ function buildCard(it) {
   let frame = a.kind === "sequence" ? a.frames[0][0] : null;
   const name = () => frame == null ? pathOf(a) : pathOf(a, frameName(a, frame));
   card.querySelector(".copy").addEventListener("click", () => copy(`${job.name} - ${name()} (job ${job.id})`));
-  card.addEventListener("click", e => { const b = e.target.closest("[data-mac]"); if (b) onMac(b.dataset.mac, job, a); });
-  if (!a.browser) noteMedia(card, `${a.ext.slice(1).toUpperCase()}: browsers can't show ${a.kind === "sequence" ? "these frames" : "this file"}`);
-  else if (a.kind === "image") {
+  const drop = () => { unshowable.add(it.id); render(last); };  // this browser can't show it, or it is gone
+  if (a.kind === "image") {
     const img = card.querySelector("img");
-    img.addEventListener("error", () => noteMedia(card, `${a.ext.slice(1).toUpperCase()}: this browser can't show it, or it is gone`));
+    img.addEventListener("error", drop);
   } else if (a.kind === "video") {
     const v = card.querySelector("video");
-    const fail = () => noteMedia(card, "This browser can't play this video, or it is gone");
+    const fail = drop;
     v.addEventListener("error", fail);
     v.addEventListener("loadedmetadata", () => { if (!v.videoWidth) fail(); });
     seen.observe(v);
@@ -160,7 +143,7 @@ function buildCard(it) {
     const range = card.querySelector("input"), label = card.querySelector("[data-label]");
     let img = card.querySelector("img"), want = 0, loading = false, shown = false;
     img.onload = () => { shown = true; };
-    img.onerror = () => { if (!shown) noteMedia(card, `${a.ext.slice(1).toUpperCase()}: this browser can't show these frames, or they are gone`); };
+    img.onerror = () => { if (!shown) drop(); };
     const show = () => { if (loading || !shown) return; loading = true; const i = want, f = frameAt(a, i);
       img.src = fileUrl(job, a, f); frame = f;
       label.textContent = `${frameName(a, f)} · ${i + 1} of ${a.count}`;
@@ -177,7 +160,7 @@ function buildCard(it) {
     // play: first the next AHEAD frames are fetched and decoded, then they show at FPS while more load behind them;
     // a frame that isn't decoded yet holds playback (a frame shown before it is decoded flashes)
     const play = card.querySelector("[data-play]"), buf = new Map();  // frame index -> Image, ahead of the shown one
-    let playing = false, started = false, last = 0, inflight = 0;
+    let playing = false, started = false, beat = 0, inflight = 0;
     const ahead = i => { const d = (i - want + a.count) % a.count; return d > 0 && d <= AHEAD; };
     const fill = () => {
       for (let k = 1; k <= AHEAD && inflight < 4; k++) {
@@ -200,9 +183,9 @@ function buildCard(it) {
         let have = 0;
         for (let k = 1; k <= need; k++) if (buf.get((want + k) % a.count)?.ready) have++;
         label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count} · loading ${have} of ${need} frames`;
-        if (have === need) { started = true; last = t - step; }
+        if (have === need) { started = true; beat = t - step; }
       }
-      if (started && t - last >= step - 2) {
+      if (started && t - beat >= step - 2) {
         const i = (want + 1) % a.count, im = buf.get(i);
         if (im && im.ready) {
           want = i; range.value = i; frame = frameAt(a, i);
@@ -210,9 +193,9 @@ function buildCard(it) {
           label.textContent = `${frameName(a, frame)} · ${i + 1} of ${a.count}${im.naturalWidth ? "" : " is gone"}`;
           card.querySelector("[data-path]").textContent = name();
           for (const k of [...buf.keys()]) if (!ahead(k)) buf.delete(k);
-          last = t - last > 2 * step ? t : last + step;  // after a hold: from now, else on the beat
+          beat = t - beat > 2 * step ? t : beat + step;  // after a hold: from now, else on the beat
           fill();
-        } else if (t - last > 500) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count} · loading`;
+        } else if (t - beat > 500) label.textContent = `${frameName(a, frame)} · ${want + 1} of ${a.count} · loading`;
       }
       requestAnimationFrame(tick);
     };
@@ -229,7 +212,7 @@ function buildCard(it) {
       playingCard = card; playing = true; loading = false;
       img.onload = img.onerror = null;  // (a frame show() asked for must not take over)
       play.textContent = "❚❚"; play.setAttribute("aria-label", "Pause");
-      last = performance.now(); fill(); requestAnimationFrame(tick);
+      beat = performance.now(); fill(); requestAnimationFrame(tick);
     });
   }
   return card;
@@ -249,6 +232,7 @@ function items(jobs, now) {
     if (!s || !s.artifacts) continue;
     const from = job.started - 2, to = (job.finished || now) + 2;
     for (const a of s.artifacts) {
+      if (!a.browser) continue;  // (what no browser shows and rq doesn't convert)
       if (a.mtime < from || a.mtime > to) continue;
       const where = pathOf(a);
       if (out.has(where)) continue;
@@ -260,7 +244,9 @@ function items(jobs, now) {
   return [...out.values()].sort((x, y) => y.a.mtime - x.a.mtime);
 }
 
+const unshowable = new Set();  // cards whose file this browser couldn't show: left out
 function render(list) {
+  list = list.filter(it => !unshowable.has(it.id));
   const shown = list.slice(0, limit), want = new Set(shown.map(it => it.id));
   for (const [id, card] of cards) if (!want.has(id)) {
     card.querySelectorAll("video").forEach(v => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch (e) {} });
@@ -303,7 +289,8 @@ async function poll() {
   last = items(f.jobs, f.now);
   render(last);
   const running = f.jobs.filter(j => !j.finished).length;
-  $("state").textContent = `${last.length} file${last.length === 1 ? "" : "s"} from ${f.jobs.length} jobs of the last 24 hours`
+  const n = last.filter(it => !unshowable.has(it.id)).length;
+  $("state").textContent = `${n} file${n === 1 ? "" : "s"} from ${f.jobs.length} jobs of the last 24 hours`
     + (running ? ` · ${running} running, its files show as they are written` : "") + ` · newest first`;
 }
 $("more").addEventListener("click", () => { limit += PAGE; render(last); });

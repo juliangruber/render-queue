@@ -295,7 +295,7 @@ under "Waiting for you" (click to open the session, if `sessions.json` has a lin
 **Outputs** (http://localhost:8642/feed, linked next to the title) shows every picture, video and frame sequence the
 jobs of the last 24 hours wrote, the newest first, one under the other at full width, to catch a bug early by looking.
 A file shows once, under the job that ran when it was written (a declared folder also holds what earlier work wrote
-there); a running job's files show as they are written. Under each: the session, the job, when, and a Copy button
+there); a running job's files show as they are written. A file this browser can't show (or one that is gone) is left out. Under each: the session, the job, when, and a Copy button
 that copies `<job name> - <path> (job <id>)` (for a sequence, the frame on screen) to tell that session about it.
 A frame sequence has a scrubber, frame steps and ▶, which plays it at 24 fps, looping (one sequence at a time;
 it first loads the next 48 frames, then plays while more load behind them, and holds on a frame that hasn't loaded
