@@ -1,8 +1,8 @@
 # render-queue
 
 `rq` lets several [Claude Code](https://claude.com/claude-code) sessions share one Mac for rendering, each working on
-its own project. Heavy jobs run strictly one at a time, first come first served. Short light jobs run next to them at
-low priority. A
+its own project. Heavy jobs run strictly one at a time, first come first served. Short light jobs and stills run
+next to them at low priority, each in its own queue. A
 local status page shows the queue with expected start and end times, the CPU cores each project uses, the GPU load and
 which sessions are waiting for you.
 
@@ -76,11 +76,11 @@ From then on you tell the queue session what to change, and it runs:
 | You say | It runs |
 | --- | --- |
 | "go" for a queued job | `rq move ID first` (it runs next) |
-| a running light job may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
+| a running light job or still may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
 | a job will take longer or shorter | `rq estimate ID 2h` |
 | stop a job | `rq cancel ID` |
 | hold a running job, keeping its turn | `rq pause ID`, later `rq resume ID` |
-| a running light job should wait its turn | `rq move ID queue` |
+| a running light job or still should wait its turn | `rq move ID queue` |
 | a session lost track of its job (after a restart or an account switch; the page says "unwatched" or "unseen") | tells it to run `rq wait ID`, not to resubmit |
 | a job whose session ended isn't wanted any more ("unwatched · session ended") | `rq cancel ID` |
 | rq was updated and its rules changed | tells every render session that the render-queue rules changed |
@@ -219,6 +219,11 @@ prompt, it tells the session which of its jobs no task watches and which results
 - **Light work** (`rq light`) has its own queue: one light job at a time, first come first served, next to the heavy
   job (the two queues don't wait for each other). It runs at low priority (`nice -n 10`), streams its output the same
   way and shows on the status page under "Rendering now". It never holds up the main queue.
+- **Stills** (`rq still`) have a third queue of their own, the same way: one still at a time, next to the heavy job
+  and the light job, at `nice -n 10`, so a still renders even while the light queue is busy with tests, encodes or
+  analyses. A still writes pictures (a picture, a frame pattern or a folder of pictures): it needs `--output`, and
+  rq refuses `--no-output` and a video file (exit 64). The 5 minute cap below applies to stills the same way, with
+  another still waiting or a heavy job active (the page marks a moved one "paused · was a still").
 - Light work is capped at 5 minutes while other work is active (a heavy job running or queued, or a light job
   waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
   and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status
@@ -242,6 +247,8 @@ rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90
        [--again | --replace] -- COMMAND...
 rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace] -- COMMAND...
                              (light work: the light queue, one at a time, at nice 10)
+rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace] -- COMMAND...
+                             (stills: the stills queue, one at a time, at nice 10, pictures only)
                              (--output PATH, -o PATH: a file, a folder/ or a frame pattern like 'renders/####.png'
                              the job writes, repeated for several; --no-output: it writes no pictures or videos;
                              every rq run and rq light needs one of them, before -- COMMAND)
@@ -253,8 +260,8 @@ rq log ID [-n 40] [-f]
 rq cancel ID
 rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its turn)
 rq move ID first             (when the user says go: this queued job runs next)
-rq move ID queue             (pause a running light job, move it to the end of the main queue)
-rq keep ID                   (when the user says so: this light job may run longer than 5 minutes)
+rq move ID queue             (pause a running light job or still, move it to the end of the main queue)
+rq keep ID                   (when the user says so: this light job or still may run longer than 5 minutes)
 rq estimate ID 90m           (set or correct a job's expected duration)
 rq start [--port 8642]       (start the dispatcher and the status page detached, one per machine)
 rq daemon [--port 8642]      (the same in the foreground)
@@ -265,7 +272,7 @@ IDs can be shortened to any part that matches only one job, finished jobs includ
 ## Status page
 
 http://localhost:8642 shows which sessions are waiting for you, the cores each project uses (in total and per
-project), the GPU utilization, the running job and light work, the queue with expected start and end times, heavy
+project), the GPU utilization, the running job, light work and stills, the queues with expected start and end times, heavy
 work outside rq, and recent jobs with how long they ran (without the time they were paused or waiting in the
 queue; "-" when the job's owner was gone and nobody saw it end) and how many outputs they declared ("2 outputs",
 "none" for `--no-output`, nothing for jobs queued before rq had `--output`). It listens on 127.0.0.1 only and shows no job

@@ -14,15 +14,17 @@ whose turn it is and serves the status page.
          [--again | --replace] -- COMMAND [ARGS...]
   rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace]
          -- COMMAND [ARGS...]   (light work: the light queue, one at a time, at nice 10)
+  rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace]
+         -- COMMAND [ARGS...]   (stills: the stills queue, one at a time, at nice 10, next to the light queue)
   rq wait ID [-n LINES]     (watch a job again: its output from here, then its exit code; at once if it ended)
   rq mine [--unwatched] [--hook]   (this session's jobs no task of it watches, results that didn't reach it)
   rq status [--json]
   rq log ID [-n LINES] [-f]
   rq cancel ID | rq pause ID | rq resume ID
   rq move ID first          (when the user says go: put a queued job next in line)
-  rq move ID queue          (pause a running light job and move it to the end of the main queue)
+  rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
-  rq keep ID                (when the user says so: a light job may run longer than 5 min)
+  rq keep ID                (when the user says so: a light job or still may run longer than 5 min)
   rq start [--port 8642]    (start the dispatcher and status page detached, once per machine)
   rq daemon [--port 8642]   (the same in the foreground)
 
@@ -84,6 +86,10 @@ OWNERS = os.path.join(STATE, "owners")  # per job: ID.lock, flocked by whoever o
 WATCH = os.path.join(STATE, "watch")  # per watcher: ID.PID.json, flocked by the rq run / rq wait that watches ID
 GRANT = os.path.join(STATE, "grant")
 GRANT_LIGHT = os.path.join(STATE, "grant-light")  # the light queue's turn: one light job at a time
+GRANT_STILL = os.path.join(STATE, "grant-still")  # the stills queue's turn: one still at a time
+# the side queues next to the main queue, by job kind: each runs one job at a time, at low priority, under the cap
+SIDE = {"light": GRANT_LIGHT, "still": GRANT_STILL}
+side = lambda j: j.get("kind") in SIDE  # a light job or a still, not (or no longer) in the main queue
 ORDER = os.path.join(STATE, "order.json")
 DISPATCHER = os.path.join(STATE, "dispatcher.json")
 ROOT = os.path.realpath(os.environ.get("RQ_ROOT") or os.path.dirname(HOME))  # the folder that holds the projects
@@ -872,17 +878,18 @@ def snapshot():
     jobs = with_tools(all_jobs())
     now = time.time()
     history = sorted([j for j in jobs if j["status"] == "done" and j.get("started") and j.get("finished")
-                      and j.get("kind") != "light"],
+                      and not side(j)],
                      key=lambda j: j["finished"])
     grant = granted()
     current = next((j for j in jobs if j["id"] == grant and j["status"] not in TERMINAL), None)
-    queued = queue_order([j for j in jobs if j["status"] == "queued" and j.get("kind") != "light"
+    queued = queue_order([j for j in jobs if j["status"] == "queued" and not side(j)
                           and not has_flag(j["id"], "cancel")])
-    light = sorted([j for j in jobs if j.get("kind") == "light" and j["status"] in ("granted", "running")],
-                   key=lambda j: j["submitted"])
-    light_queued = queue_order([j for j in jobs if j.get("kind") == "light" and j["status"] == "queued"
-                                and not has_flag(j["id"], "cancel")])
-    for job in light:
+    lane = {kind: sorted([j for j in jobs if j.get("kind") == kind and j["status"] in ("granted", "running")],
+                         key=lambda j: j["submitted"]) for kind in SIDE}
+    lane_queued = {kind: queue_order([j for j in jobs if j.get("kind") == kind and j["status"] == "queued"
+                                      and not has_flag(j["id"], "cancel")]) for kind in SIDE}
+    light, light_queued, still, still_queued = lane["light"], lane_queued["light"], lane["still"], lane_queued["still"]
+    for job in light + still:
         job["elapsed"] = now - (job.get("started") or job["submitted"])
     d = dispatcher_state()
     # while the queue waits for renders outside it, nobody knows when they end, so start times are unknown
@@ -908,9 +915,11 @@ def snapshot():
                       reverse=True)[:25]
     for job in finished:
         job["took"] = took(job)
-    news = see_jobs(([current] if current else []) + queued + light + light_queued, finished, jobs, d, now)
+    news = see_jobs(([current] if current else []) + queued + light + light_queued + still + still_queued, finished,
+                    jobs, d, now)
     return {"now": now, "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
             "light": [public(j) for j in light], "light_queued": [public(j) for j in light_queued],
+            "still": [public(j) for j in still], "still_queued": [public(j) for j in still_queued],
             "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now,
             "all_done_known": known if (current or queued) else now}
 
@@ -1460,6 +1469,17 @@ class OutputError(ValueError):
     """An --output that rq refuses, with what to change."""
 
 
+def still_outputs(outputs):
+    """A still writes pictures: --output for each, none of them a video file (--no-output is no still)."""
+    if not outputs:
+        raise OutputError("a still writes pictures: pass --output PATH for each picture, frame pattern or folder it "
+                          "writes (rq light --no-output is for work that writes none)")
+    videos = [o["declared"] for o in outputs if o["kind"] == "file" and ext_of(o["path"]) in VIDEO_EXT]
+    if videos:
+        raise OutputError("a still writes pictures, not videos (%s): queue a video with rq light or rq run"
+                          % ", ".join(videos))
+
+
 def declare_outputs(paths, no_output, cwd, project):
     """The outputs for a job's record, from rq run's --output PATH (repeated) and --no-output: each a file, a
     folder (a trailing / or an existing folder) or a frame pattern (####, %04d, %d), relative to cwd, inside the
@@ -1967,38 +1987,40 @@ def remove_turn(path, job_id):
 
 def repair_grants(jobs):
     """A job marked granted that holds no turn (the dispatcher stopped between the two writes) goes back in line."""
-    turns = {granted(GRANT), granted(GRANT_LIGHT)}
+    turns = lambda: {granted(GRANT)} | {granted(path) for path in SIDE.values()}
     for job in list(jobs.values()):
-        if job["status"] == "granted" and job["id"] not in turns:
-            new = update_job(job["id"], only_if=lambda j: j["status"] == "granted"
-                             and j["id"] not in {granted(GRANT), granted(GRANT_LIGHT)}, status="queued")
+        if job["status"] == "granted" and job["id"] not in turns():
+            new = update_job(job["id"], only_if=lambda j: j["status"] == "granted" and j["id"] not in turns(),
+                             status="queued")
             jobs[job["id"]] = new or load_job(job["id"]) or job
 
 
-def dispatch_light(jobs):
-    """The light queue: one light job at a time, oldest first. A running light job (also one started before this
-    queue existed) holds the slot; one that ran over the cap and moved into the main queue frees it."""
-    turn = granted(GRANT_LIGHT)
+def dispatch_side(jobs, kind):
+    """A side queue (light jobs, or stills): one job of its kind at a time, in queue order. A running one (also a
+    light job started before this queue existed) holds the slot; one that ran over the cap and moved into the main
+    queue frees it."""
+    path = SIDE[kind]
+    turn = granted(path)
     if turn:
         job = load_job(turn)
-        if not job or job["status"] in TERMINAL or job.get("kind") != "light":
-            remove_turn(GRANT_LIGHT, turn)
+        if not job or job["status"] in TERMINAL or job.get("kind") != kind:
+            remove_turn(path, turn)
             turn = None
     if turn:
         return
-    current = [j for j in jobs.values() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
+    current = [j for j in jobs.values() if j.get("kind") == kind and j["status"] in ("granted", "running")]
     if current:
         return
-    waiting = queue_order([j for j in jobs.values() if j.get("kind") == "light" and j["status"] == "queued"
+    waiting = queue_order([j for j in jobs.values() if j.get("kind") == kind and j["status"] == "queued"
                            and waits(j)])
     if waiting:
         job = waiting[0]
         # the record first: its client may start as soon as the turn file names it
-        new = update_job(job["id"], only_if=lambda j: j["status"] == "queued" and j.get("kind") == "light"
+        new = update_job(job["id"], only_if=lambda j: j["status"] == "queued" and j.get("kind") == kind
                          and not has_flag(j["id"], "cancel"), status="granted", granted=time.time())
         if new:
             jobs[job["id"]] = new
-            give_turn(GRANT_LIGHT, job["id"])
+            give_turn(path, job["id"])
 
 
 def stop_frozen(job, pgid):
@@ -2129,15 +2151,17 @@ def queue_view(jobs):
     """The queues in the order they run, published in dispatcher.json, so waiting clients (rq run, rq wait, and
     the light cap) need not read every record. The shape is the one rq clients of every version read: main and
     light, the ids of the main and the light queue; running, {project, name} of the job with the main turn, or
-    None; light_running, a list of {project, name}."""
-    waiting = lambda light: [j["id"] for j in queue_order([
-        j for j in jobs.values() if j["status"] == "queued" and (j.get("kind") == "light") == light and waits(j)])]
+    None; light_running, a list of {project, name}. Since the stills queue also still and still_running."""
+    waiting = lambda kind: [j["id"] for j in queue_order([
+        j for j in jobs.values() if j["status"] == "queued" and (j.get("kind") if side(j) else None) == kind
+        and waits(j)])]
     brief = lambda j: {"project": j["project"], "name": j["name"]}
     turn = jobs.get(granted() or "")
-    light_now = [j for j in jobs.values() if j.get("kind") == "light" and j["status"] in ("granted", "running")]
-    return {"main": waiting(False), "light": waiting(True),
+    now = lambda kind: [brief(j) for j in jobs.values() if j.get("kind") == kind
+                        and j["status"] in ("granted", "running")]
+    return {"main": waiting(None), "light": waiting("light"), "still": waiting("still"),
             "running": brief(turn) if turn and turn["status"] not in TERMINAL else None,
-            "light_running": [brief(j) for j in light_now]}
+            "light_running": now("light"), "still_running": now("still")}
 
 
 def continues_here(job):
@@ -2170,7 +2194,8 @@ def dispatch_once(state):
     try:
         sweep(jobs)
         repair_grants(jobs)
-        dispatch_light(jobs)
+        for kind in SIDE:
+            dispatch_side(jobs, kind)
         dispatch_main(state, jobs)
     finally:
         state["queue"] = queue_view(jobs)
@@ -2208,8 +2233,7 @@ def dispatch_main(state, jobs):
         state["warnings"] = strays(ours, video)
         state["note"] = note or "running %s" % grant
         return
-    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and j.get("kind") != "light"
-                          and waits(j)])
+    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)])
     state["warnings"] = strays(ours, video)
     stopping = sorted(i for i in _cancels_sent if (jobs.get(i) or {}).get("status") == "queued")
     if queued and stopping:  # a frozen job nobody owns runs again until its processes end: not next to the next job
@@ -2518,7 +2542,7 @@ def set_outputs(job_id, outputs, no_output):
 
 
 def cmd_run(args):
-    """rq run / rq light: submit the job to its own rq supervisor (detached, so the session's task can't kill it),
+    """rq run / rq light / rq still: submit the job to its own rq supervisor (detached, so the session's task can't kill it),
     then watch it until it ends (unless --detach)."""
     setup()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -2533,6 +2557,8 @@ def cmd_run(args):
     cwd = os.getcwd()
     try:  # before anything is written: this refusal is how a session learns to say where its job writes
         outputs = declare_outputs(args.outputs or [], args.no_output, cwd, project)
+        if args.cmd == "still":
+            still_outputs(outputs)
     except OutputError as e:
         print("rq: %s. Nothing was queued." % e, file=sys.stderr)
         words = command[0].split() if len(command) == 1 else command
@@ -2550,8 +2576,8 @@ def cmd_run(args):
                       rq_cmd(args.cmd, "--name", "NAME", *est, "--no-output", "--", "COMMAND")), file=sys.stderr)
         return EXIT_USAGE
     argv = ["/bin/zsh", "-c", command[0]] if len(command) == 1 else command
-    light = args.cmd == "light"
-    if light:  # the light queue: one at a time, at low priority, never holds the main queue
+    light = args.cmd in SIDE
+    if light:  # a side queue (light or stills): one at a time, at low priority, never holds the main queue
         argv = ["nice", "-n", str(QUIET_NICE)] + argv
     d = dispatcher_state()
     if d["alive"] and (d.get("proto") or 1) < PROTO:
@@ -2597,7 +2623,7 @@ def cmd_run(args):
     log_path = os.path.join(LOGS, job_id + ".log")
     job = {"id": job_id, "v": 2, "project": project, "name": args.name, "cwd": cwd, "command": text, "argv": argv,
            "estimate": parse_duration(args.estimate), "client_pid": os.getpid(), "submitted": time.time(),
-           "status": "queued", "kind": "light" if light else "heavy", "submitter": submitter(project),
+           "status": "queued", "kind": args.cmd if light else "heavy", "submitter": submitter(project),
            "boot": boot_id()}
     if outputs:
         job["outputs"] = outputs  # (what the sheet shows: what is at these paths when it is opened)
@@ -2689,20 +2715,23 @@ def queue_status(job, cache):
             snap = snapshot()
             cache.update(at=time.time(), q={"main": [j["id"] for j in snap["queued"]],
                                             "light": [j["id"] for j in snap["light_queued"]],
-                                            "running": snap["running"], "light_running": snap["light"]})
+                                            "still": [j["id"] for j in snap["still_queued"]],
+                                            "running": snap["running"], "light_running": snap["light"],
+                                            "still_running": snap["still"]})
         q = cache.get("q") or {}
-    light = job.get("kind") == "light"
-    line = q.get("light" if light else "main") or []
+    kind = job.get("kind") if side(job) else None
+    light = bool(kind)
+    line = q.get(kind or "main") or []
     text = "%s%s%s" % ("paused, waiting in the queue" if job.get("started") else "waiting",
-                       " for the light slot" if light else "",
+                       " for the %s slot" % kind if light else "",
                        ", position %d" % (line.index(job["id"]) + 1) if job["id"] in line else "")
-    now = q.get("light_running") if light else q.get("running")
+    now = q.get(kind + "_running") if light else q.get("running")
     if isinstance(now, list):
         now = now[0] if now else None
     if isinstance(now, dict):  # {project, name}; (a plain "project/name" too)
         now = "%s/%s" % (now.get("project"), now.get("name"))
     if now:
-        text += ", %s now: %s" % ("light job" if light else "rendering", now)
+        text += ", %s now: %s" % ("%s job" % kind if light else "rendering", now)
     elif not light and (d.get("note") or "").startswith("waiting"):
         text += ", " + re.sub(r" \(\d+s so far\)", "", d["note"])
     return text
@@ -3127,7 +3156,7 @@ class Supervisor:
             if has_flag(self.id, "cancel"):
                 self.finish("cancelled", reason="%s while queued" % (job.get("cancel_reason") or "rq cancel"))
                 return False
-            if granted(GRANT_LIGHT if job.get("kind") == "light" else GRANT) == self.id:
+            if granted(SIDE.get(job.get("kind"), GRANT)) == self.id:
                 self.job = job
                 return True
             self.note_watchers()
@@ -3164,7 +3193,7 @@ class Supervisor:
                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
-        self.light = job.get("kind") == "light"
+        self.light = side(job)
 
     def supervise(self):
         """Every 0.5 s: has the job ended, was it cancelled, was the supervisor told to stop, the light cap? Never a
@@ -3238,15 +3267,15 @@ class Supervisor:
                     self.continue_turn(pgid)
                 return
             now = time.time()
-            if job["status"] != "running" or job.get("kind") != "light" or now < self.next_cap:
+            if job["status"] != "running" or not side(job) or now < self.next_cap:
                 return
             self.next_cap = now + 2
             if has_flag(self.id, "keep") or has_flag(self.id, "paused") or (run_time(job, now) or 0) < LIGHT_CAP:
                 return
-            if not other_work(self.id):
+            if not other_work(self.id, job["kind"]):
                 if not self.alone_said:
-                    say("running longer than %s as light work, but nothing else is waiting: it runs on"
-                        % fmt_duration(LIGHT_CAP))
+                    say("running longer than %s as %s, but nothing else is waiting: it runs on"
+                        % (fmt_duration(LIGHT_CAP), side_words(job)))
                     self.alone_said = True
                 return
             self.cap(pgid)
@@ -3263,21 +3292,21 @@ class Supervisor:
         now = time.time()
         with jobs_lock():
             job = load_job(self.id)
-            if not job or job["status"] != "running" or job.get("kind") != "light" or self.proc.poll() is not None \
+            if not job or job["status"] != "running" or not side(job) or self.proc.poll() is not None \
                     or self.sig["n"] or any(has_flag(self.id, k) for k in ("keep", "paused", "cancel")):
                 return
             if not signal_group(pgid, signal.SIGSTOP):
                 return
             moved = None
             try:
-                moved = update_job(self.id, kind="heavy", status="queued", promoted=now, submitted=now,
+                moved = update_job(self.id, kind="heavy", was=job["kind"], status="queued", promoted=now, submitted=now,
                                    stopped=lambda j: open_stop(j, now))
             finally:
                 if not moved:
                     self.send(pgid, signal.SIGCONT)
         if moved:
-            say("ran longer than %s as light work while other work is waiting: paused and moved into the queue, "
-                "continuing when it's its turn" % fmt_duration(LIGHT_CAP))
+            say("ran longer than %s as %s while other work is waiting: paused and moved into the queue, "
+                "continuing when it's its turn" % (fmt_duration(LIGHT_CAP), side_words(job)))
 
     def continue_turn(self, pgid):
         """Its turn, paused in the queue: running again, its stop closed, SIGCONT. One that rq pause paused as
@@ -3382,22 +3411,27 @@ class Supervisor:
                     reason="rq's supervisor failed: %s (see rq log %s)" % (type(error).__name__, self.id))
 
 
-def other_work(job_id):
-    """Work a long light job would hold up or compete with: a heavy job running or queued, or a light job waiting.
+def side_words(job):
+    return "a still" if job.get("kind") == "still" else "light work"
+
+
+def other_work(job_id, kind="light"):
+    """Work a long light job (or still) would hold up or compete with: a heavy job running or queued, or a job of
+    its own side queue waiting.
     From the queue the dispatcher publishes (it leaves out queued jobs being cancelled or whose processes it is
     stopping, and closes those whose owner is gone); with no dispatcher, from the records, where a queued job that
     was cancelled or whose owner is gone doesn't count: nobody waits for it."""
     d = dispatcher_state()
     q = d.get("queue")
     if d["alive"] and isinstance(q, dict):
-        others = [i for i in (q.get("main") or []) + (q.get("light") or []) if i != job_id]
+        others = [i for i in (q.get("main") or []) + (q.get(kind) or []) if i != job_id]
         return {"id": others[0]} if others else {"id": None, "running": q["running"]} if q.get("running") else None
     for job in all_jobs():
         if job["id"] == job_id or job["status"] not in ("queued", "granted", "running"):
             continue
         if job["status"] == "queued" and (has_flag(job["id"], "cancel") or not owner_alive(job)):
             continue
-        if job.get("kind") != "light" or job["status"] == "queued":
+        if not side(job) or (job["status"] == "queued" and job.get("kind") == kind):
             return job
     return None
 
@@ -3461,20 +3495,20 @@ def cmd_estimate(args):
 
 def cmd_keep(args):
     job = find_job(args.id)
-    if job.get("kind") != "light" or job["status"] in TERMINAL:
-        sys.exit("rq: %s isn't a running light job" % job["id"])
+    if not side(job) or job["status"] in TERMINAL:
+        sys.exit("rq: %s isn't a running light job or still" % job["id"])
     set_flag(job["id"], "keep")
-    print("rq: %s may run on as light work, past the cap" % job["id"])
+    print("rq: %s may run on as %s, past the cap" % (job["id"], side_words(job)))
 
 
 def cmd_move(args):
     job = find_job(args.id)
-    if args.where == "queue":  # a running light job, paused and moved to the end of the main queue
+    if args.where == "queue":  # a running light job or still, paused and moved to the end of the main queue
         with jobs_lock():  # (the light cap moves it under this lock too: one of them does, never both)
             job = load_job(job["id"]) or job
-            group = job_group(job) if job.get("kind") == "light" and job["status"] == "running" else None
+            group = job_group(job) if side(job) and job["status"] == "running" else None
             if not group:
-                sys.exit("rq: %s isn't a running light job" % job["id"])
+                sys.exit("rq: %s isn't a running light job or still" % job["id"])
             v1 = (job.get("v") or 1) < 2
             set_flag(job["id"], "keep")  # its owner must not move it again (an older client's light cap)
             try:
@@ -3488,8 +3522,8 @@ def cmd_move(args):
             now = time.time()
             moved = None
             try:  # a v2 job's supervisor continues it on its turn; an older client's job, the dispatcher
-                moved = update_job(job["id"], only_if=lambda j: j["status"] == "running" and j.get("kind") == "light",
-                                   kind="heavy", status="queued", promoted=now, submitted=now,
+                moved = update_job(job["id"], only_if=lambda j: j["status"] == "running" and side(j),
+                                   kind="heavy", was=job.get("kind"), status="queued", promoted=now, submitted=now,
                                    stopped=lambda j: open_stop(j, now),
                                    **({"resume_by_dispatcher": True} if v1 else {}))
             finally:
@@ -3551,6 +3585,13 @@ def cmd_status(args):
     if snap["light_queued"]:
         print("\nlight queue:")
         for i, j in enumerate(snap["light_queued"], 1):
+            print("  %d. %s  %s/%s%s" % (i, j["id"], j["project"], j["name"], seen(j)))
+    for j in snap["still"]:
+        print("\nstill:    %s  %s/%s  %s elapsed%s" % (j["id"], j["project"], j["name"], fmt_duration(j["elapsed"]),
+                                                     seen(j)))
+    if snap["still_queued"]:
+        print("\nstills queue:")
+        for i, j in enumerate(snap["still_queued"], 1):
             print("  %d. %s  %s/%s%s" % (i, j["id"], j["project"], j["name"], seen(j)))
     if snap["queued"]:
         print("\nqueued:")
@@ -3772,7 +3813,9 @@ def main():
     p = argparse.ArgumentParser(prog="rq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
     for name, text in (("run", "queue a heavy job; its own rq supervisor runs it on its turn; watch its output"),
-                       ("light", "queue a light job: one at a time, at low priority, next to the main queue")):
+                       ("light", "queue a light job: one at a time, at low priority, next to the main queue"),
+                       ("still", "queue a still (pictures only, under 5 min): the stills queue, one at a time, at "
+                                 "low priority, next to the main and the light queue")):
         r = sub.add_parser(name, help=text, description=text)
         r.add_argument("--name", required=True)
         r.add_argument("--project", help="the project's folder name in the projects folder (default: from the "
@@ -3824,7 +3867,7 @@ def main():
     except OSError:
         if args.cmd != "mine":  # a hook must never fail
             raise
-    if args.cmd in ("run", "light"):
+    if args.cmd in ("run", "light", "still"):
         sys.exit(cmd_run(args))
     if args.cmd in ("wait", "mine", "_supervise"):
         sys.exit({"wait": cmd_wait, "mine": cmd_mine, "_supervise": cmd_supervise}[args.cmd](args))

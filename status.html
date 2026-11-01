@@ -362,14 +362,14 @@ async function refresh() {
     : `<span class="dot off"></span>dispatcher not running`;
   showWaiting(d.sessions);
   notifyWaiting(d.sessions);
-  favicon((d.sessions || []).some(needsYou), !!(s.running || (s.light || []).length));
+  favicon((d.sessions || []).some(needsYou), !!(s.running || (s.light || []).length || (s.still || []).length));
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;
   $("alldone").textContent = busy ? (s.all_done ? `All done ~${day(s.all_done)}` : s.all_done_known ? `All done ~${day(s.all_done_known)} + ?` : "All done: unknown (no estimate)") : "Queue empty";
 
   const r = s.running;
-  const light = s.light || [];
+  const light = (s.light || []).concat(s.still || []);
   const heavyCard = r => {
     const pct = r.expected ? Math.min(100, 100 * r.elapsed / r.expected) : 0;
     const over = r.expected && r.elapsed > r.expected;
@@ -381,10 +381,10 @@ async function refresh() {
         <span>expected ${dur(r.expected)}</span><span>${r.eta ? (over ? "overdue since " : "done ~") + day(r.eta) : "no estimate"}</span></div>
       ${programText(r)}</div>`;
   };
-  // light work runs next to the queue's job: same section, annotated, without a progress bar
+  // light work and stills run next to the queue's job: same section, annotated, without a progress bar
   const lightCard = j => `<div class="card" style="margin-top:8px">
       <div class="row"><span class="proj">${esc(j.project)}</span><span class="name">${esc(j.name)}</span>${jobLogos(j)}
-        <span class="tag">light</span>${seenTags(j)}</div>
+        <span class="tag">${j.kind === "still" ? "still" : "light"}</span>${seenTags(j)}</div>
       <div class="row sub" style="margin-top:6px"><span>started ${t(j.started || j.submitted)}</span><span>${dur(j.elapsed)} elapsed</span></div>
       ${programText(j)}</div>`;
   $("running").innerHTML = (r || light.length) ? (r ? heavyCard(r) : `<div class="empty">No queued job is rendering.</div>`) + light.map(lightCard).join("")
@@ -401,7 +401,7 @@ async function refresh() {
 
   $("queue").innerHTML = s.queued.length ? `<table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th>
     <th>Expected</th><th>Start</th><th>Done</th></tr>${s.queued.map((j, i) => `<tr><td class="num">${i + 1}</td>
-    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ' <span class="tag paused" title="It ran longer than 5 min as light work while other work was waiting, so it was paused and moved into the queue">paused · was light</span>' : ""}${seenTags(j)}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
+    <td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.promoted ? ` <span class="tag paused" title="It ran longer than 5 min as ${j.was === "still" ? "a still" : "light work"} while other work was waiting, so it was paused and moved into the queue">paused · was ${j.was === "still" ? "a still" : "light"}</span>` : ""}${seenTags(j)}</td><td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td>
     <td class="num">${dur(j.expected)}</td><td class="num">~${day(j.eta_start)}</td><td class="num">~${day(j.eta)}</td></tr>`).join("")}</table>`
     : `<div class="empty">Nothing waiting.</div>`;
   // the second queue: light jobs wait for the one light slot, independent of the main queue
@@ -410,9 +410,15 @@ async function refresh() {
     <table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th></tr>
     ${lq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">light</span>${seenTags(j)}</td>
       <td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td></tr>`).join("")}</table>` : "";
+  // the third queue: stills wait for the one stills slot, so they render even while light work is busy
+  const sq = s.still_queued || [];
+  $("queue").innerHTML += sq.length ? `<div class="sub" style="margin:14px 0 8px">Stills queue · one still at a time</div>
+    <table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th></tr>
+    ${sq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">still</span>${seenTags(j)}</td>
+      <td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td></tr>`).join("")}</table>` : "";
 
   const recent = s.finished.length ? `<table><tr><th>Finished</th><th>Project</th><th>Job</th><th>Tool(s)</th><th>Took</th><th>Result</th><th class="hide-sm">Output</th></tr>
-    ${s.finished.slice(0, 10).map(j => `<tr class="click" data-job="${esc(j.id)}" tabindex="0" title="Show what is at the outputs it declared"><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" ? ' <span class="tag">light</span>' : ""}${why(j)}</td>
+    ${s.finished.slice(0, 10).map(j => `<tr class="click" data-job="${esc(j.id)}" tabindex="0" title="Show what is at the outputs it declared"><td class="num">${day(j.finished)}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)}${j.kind === "light" || j.kind === "still" ? ` <span class="tag">${j.kind}</span>` : ""}${why(j)}</td>
     <td>${programTool(j)}</td><td class="num">${took(j) == null ? "-" : dur(took(j))}</td>
     <td><span class="tag ${esc(j.status)}">${esc(j.status)}${j.exit != null && j.status === "failed" ? " " + j.exit : ""}</span>${seenTags(j)}</td>
     <td class="out hide-sm">${outputText(j)}</td></tr>`).join("")}</table>`
@@ -492,7 +498,7 @@ function releaseVideo(el) { try { el.pause(); el.removeAttribute("src"); el.load
 
 function renderSheet(v) {
   sheet.job = v;
-  $("sheet-title").innerHTML = `<span class="proj">${esc(v.project)}</span><span class="name">${esc(v.name)}</span>${v.kind === "light" ? ' <span class="tag">light</span>' : ""}
+  $("sheet-title").innerHTML = `<span class="proj">${esc(v.project)}</span><span class="name">${esc(v.name)}</span>${v.kind === "light" || v.kind === "still" ? ` <span class="tag">${v.kind}</span>` : ""}
     ${jobLogos(v)} <span class="tag ${esc(v.status)}">${esc(v.status)}${v.exit != null && v.status === "failed" ? " " + v.exit : ""}</span>`;
   $("sheet-meta").textContent = v.pending ? (v.started ? `running since ${day(v.started)}` : "waiting in the queue")
     : (v.started ? `${day(v.started)} to ${day(v.finished)}${took(v) == null ? "" : " · took " + dur(took(v))}` : "never started")
