@@ -62,6 +62,7 @@ import json
 import mimetypes
 import os
 import random
+import resource
 import re
 import select
 import shutil
@@ -2888,6 +2889,13 @@ def watch(job_id, offset=0, seen=b"", pending=None, side=None, rest=None):
 def cmd_wait(args):
     """rq wait ID...: watch jobs again. The last lines of a job's log, then its output from there; for a job that
     has ended, its result at once. Never cancels anything."""
+    try:  # it holds a locked watch file per job: room for hundreds of ids, where launchd's default soft limit is 256
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 10240 if hard == resource.RLIM_INFINITY else min(10240, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ValueError, OSError):
+        pass
     jobs = []
     for prefix in args.ids:
         job = find_job(prefix)
