@@ -3088,14 +3088,61 @@ def cmd_mine(args):
 
 # ---------- the supervisor: rq _supervise ----------
 
+STOPS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+# While its job is queued, a supervisor waits as this small program instead (see Supervisor.wait_small): the same
+# process, environment, sandbox and owner lock in a quarter of the memory (6 MB, not 26), as hundreds of stills may
+# be queued at once. It turns back into rq _supervise --waited on its turn, a cancel, the job's end or a change of
+# its kind (rq move), and on SIGTERM, SIGINT or SIGHUP (--sig), which stay blocked across both execs, so none is lost.
+WAITER = r"""
+import json, os, signal, sys, time
+rq, job_id, fd, kind, grant, record, cancel = sys.argv[1:8]
+got = []
+for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(s, lambda n, f: got.append(n))
+signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))
+def due():
+    try:
+        with open(grant) as f:
+            if f.read().strip() == job_id:
+                return True
+    except OSError:
+        pass
+    if os.path.exists(cancel):
+        return True
+    try:
+        with open(record) as f:
+            job = json.load(f)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return job.get("status") in ("done", "failed", "cancelled", "lost") or (job.get("kind") or "heavy") != kind
+while True:
+    while not got and not due():
+        time.sleep(1)
+    signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))
+    try:
+        os.execv(sys.executable, [sys.executable, rq, "_supervise", job_id, "--lock-fd", fd, "--waited"]
+                 + (["--sig", str(got[0])] if got else []))
+    except OSError:
+        if got:  # stopped, and rq can't be started: the lock goes with this process, the dispatcher sees it lost
+            sys.exit(1)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM, signal.SIGINT, signal.SIGHUP))
+        time.sleep(5)
+"""
+
+
 def cmd_supervise(args):
-    """rq _supervise ID --lock-fd N, started detached by rq run with its owner lock (see Supervisor)."""
-    sig = {"n": None}
+    """rq _supervise ID --lock-fd N, started detached by rq run with its owner lock (see Supervisor). --waited: back
+    from WAITER, which it became while the job was queued; --sig N: the signal the waiter got."""
+    sig = {"n": args.sig}
 
     def on_signal(signum, frame):  # a Python handler, not SIG_IGN: the job must start with the default handling
         sig["n"] = sig["n"] or signum
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in STOPS:
         signal.signal(s, on_signal)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)  # (blocked by the waiter across the exec; the job inherits it)
     job_id, fd = args.id, args.lock_fd
     try:
         handed = os.fstat(fd).st_ino == os.stat(owner_lock(job_id)).st_ino
@@ -3108,9 +3155,12 @@ def cmd_supervise(args):
         return 1
     sup = Supervisor(job_id, fd, sig)
     me = {"pid": os.getpid(), "start": proc_start(os.getpid())}
-    # (the dispatcher may have granted it already: it can do that as soon as the record exists)
-    job = update_job(job_id, only_if=lambda j: (j.get("v") or 1) >= 2 and j["status"] in ("queued", "granted")
-                     and not j.get("owner"), owner=me, client_pid=os.getpid())
+    if args.waited:  # the job's owner already: this very process (an exec keeps the pid)
+        job = load_job(job_id)
+        job = job if job and (job.get("owner") or {}).get("pid") == os.getpid() else None
+    else:  # (the dispatcher may have granted it already: it can do that as soon as the record exists)
+        job = update_job(job_id, only_if=lambda j: (j.get("v") or 1) >= 2 and j["status"] in ("queued", "granted")
+                         and not j.get("owner"), owner=me, client_pid=os.getpid())
     if not job:
         say("rq supervisor of %s: not starting, the job is %s" % (job_id, (load_job(job_id) or {}).get("status")))
         sup.release()
@@ -3168,7 +3218,26 @@ class Supervisor:
                 self.job = job
                 return True
             self.note_watchers()
+            self.wait_small(job)
             time.sleep(1)
+
+    def wait_small(self, job):
+        """Become WAITER until something changes (it returns only if the exec fails). Notes for tasks that stop
+        watching meanwhile are written once it is back."""
+        kind = job.get("kind") or "heavy"
+        argv = [sys.executable, "-sS", "-c", WAITER, RQ_PATH, self.id, str(self.lock_fd), kind,
+                SIDE.get(kind, GRANT), job_path(self.id), flag(self.id, "cancel")]
+        sys.stdout.flush()
+        sys.stderr.flush()
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOPS)
+        try:
+            os.set_inheritable(self.lock_fd, True)
+            os.execv(sys.executable, argv)
+        except OSError as e:
+            say("could not wait as a small process (%s); waiting as rq" % (e.strerror or e))
+        finally:  # (only reached if the exec failed)
+            os.set_inheritable(self.lock_fd, False)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, STOPS)
 
     def start(self):
         job = self.job
@@ -3853,6 +3922,8 @@ def main():
     sup = sub.add_parser("_supervise")  # started by rq run, detached: the job's owner
     sup.add_argument("id")
     sup.add_argument("--lock-fd", type=int, required=True)
+    sup.add_argument("--waited", action="store_true")  # back from WAITER
+    sup.add_argument("--sig", type=int)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     for name in ("cancel", "pause", "resume", "keep"):

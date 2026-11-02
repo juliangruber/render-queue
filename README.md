@@ -344,7 +344,10 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
   The supervisor starts the command in a new process group (with `caffeinate -i`), its output into the log, and
   records the result. Before the job's record exists, `rq run` takes an flock on `state/owners/ID.lock` and hands
   that open file to the supervisor, which holds it until it has recorded the end: the lock, not a pid, says that
-  the job has an owner.
+  the job has an owner. While its job is queued, the supervisor execs a small Python loop (about 6 MB instead of
+  26) in the same process, with the same environment, sandbox and lock, which checks the turn, the cancel flag and
+  the record every second and execs back into `rq _supervise` when one changes or a signal comes, so hundreds of
+  queued stills cost little memory. Notes for tasks that stopped watching a queued job are written once it starts.
 - If a supervisor dies (`kill -9`), its job keeps the turn until its processes have ended; then the dispatcher
   records it as lost, or as cancelled if it was being cancelled, with the reason. Queued jobs whose supervisor is
   gone are cleaned up on every check, also while another job has the turn. A job from before the Mac restarted is
