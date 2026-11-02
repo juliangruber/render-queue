@@ -217,7 +217,8 @@ prompt, it tells the session which of its jobs no task watches and which results
   following a job doesn't count for the session that queued it. With `--hook` it reads a Claude Code hook's JSON
   on stdin; it prints nothing when there is nothing to report and always exits 0.
 - **Light work** (`rq light`) has its own queue: one light job at a time, first come first served, next to the heavy
-  job (the two queues don't wait for each other). It runs at low priority (`nice -n 10`), streams its output the same
+  job (the two queues don't wait for each other). While no heavy job has the main turn, two light jobs run at once;
+  a second one that started then runs on when a heavy job starts. It runs at low priority (`nice -n 10`), streams its output the same
   way and shows on the status page under "Rendering now". It never holds up the main queue.
 - **Stills** (`rq still`) have a third queue of their own, the same way: one still at a time, next to the heavy job
   and the light job, at `nice -n 10`, so a still renders even while the light queue is busy with tests, encodes or
@@ -246,7 +247,7 @@ prompt, it tells the session which of its jobs no task watches and which results
 rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90m] [--detach]
        [--again | --replace] -- COMMAND...
 rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace] -- COMMAND...
-                             (light work: the light queue, one at a time, at nice 10)
+                             (light work: the light queue, one at a time (two while no heavy job runs), at nice 10)
 rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace] -- COMMAND...
                              (stills: the stills queue, one at a time, at nice 10, pictures only)
                              (--output PATH, -o PATH: a file, a folder/ or a frame pattern like 'renders/####.png'

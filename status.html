@@ -406,7 +406,7 @@ async function refresh() {
     : `<div class="empty">Nothing waiting.</div>`;
   // the second queue: light jobs wait for the one light slot, independent of the main queue
   const lq = s.light_queued || [];
-  $("queue").innerHTML += lq.length ? `<div class="sub" style="margin:14px 0 8px">Light queue · one light job at a time</div>
+  $("queue").innerHTML += lq.length ? `<div class="sub" style="margin:14px 0 8px">Light queue · one light job at a time, two while no queued job runs</div>
     <table><tr><th>#</th><th>Project</th><th>Job</th><th>Tool(s)</th><th class="hide-sm">Queued</th></tr>
     ${lq.map((j, i) => `<tr><td class="num">${i + 1}</td><td class="proj">${esc(j.project)}</td><td>${esc(j.name)} <span class="tag">light</span>${seenTags(j)}</td>
       <td>${programTool(j)}</td><td class="num hide-sm">${t(j.submitted)}</td></tr>`).join("")}</table>` : "";

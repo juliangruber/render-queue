@@ -68,8 +68,8 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   pattern or a folder); rq refuses `--no-output` and video files (exit 64): those go through `rq light`.
 - Other light work under 5 minutes (tests, previews, short encodes, analyses) goes through `rq light`, also as a
   background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
-  Light jobs run one at a time next to the heavy job, at a lower CPU priority (nice 10), so one may wait for its
-  turn. A light job or still that runs past 5 minutes while other work is waiting is paused and moved into the
+  Light jobs run one at a time next to the heavy job (two at a time while no heavy job runs), at a lower CPU
+  priority (nice 10), so one may wait for its turn. A light job or still that runs past 5 minutes while other work is waiting is paused and moved into the
   queue, and continues when it's its turn.
 - Never run renders, Blender, ffmpeg or other heavy work outside rq: it holds up the whole queue.
 - Tell the user the job id when you queue a job. `rq status` shows its position and expected times; the status page
