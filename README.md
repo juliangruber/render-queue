@@ -295,7 +295,9 @@ Tags say who sees a job (hover over one for more):
 
 The tab's icon, an old movie camera, is in color while a job runs (heavy or light) and gray while the queue is idle.
 It gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
-may wait for your permission, or its turn ended while its jobs are unwatched or its results unseen.
+may wait for your permission, or its turn ended before results of its jobs that nobody has seen (it can't know
+them). Results that ended while the session still worked don't count, nor jobs still queued or running: the
+session may have checked them another way, and an unwatched job counts once it ends after the turn.
 
 "Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a session shows up
 under "Waiting for you" (click to open the session, if `sessions.json` has a link for it). Jobs ending don't notify.

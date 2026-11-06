@@ -257,9 +257,11 @@ const cores = n => n >= 10 ? n.toFixed(0) : n.toFixed(1);
 
 // sessions waiting for the user: read by the dispatcher from each session's transcript, longest waiting first
 const WAIT_LABEL = {waiting: "waiting for you", question: "asked you a question", permission: "may need your permission"};
-// a session that needs you to do something: a question, a permission prompt, or (its turn ended) jobs no task of it
-// watches or results it hasn't seen; a session that is only done with its turn doesn't
-const needsYou = x => x.state === "question" || x.state === "permission" || (x.state === "waiting" && (x.notes || []).length > 0);
+// a session that needs you to do something: a question, a permission prompt, or (its turn ended) results that ended
+// after its turn did, so it can't know them; a session that is only done with its turn doesn't, nor one whose
+// unseen results ended while it still worked (it may have checked them another way)
+const afterTurn = x => (x.notes || []).filter(n => n.after_turn);
+const needsYou = x => x.state === "question" || x.state === "permission" || (x.state === "waiting" && afterTurn(x).length > 0);
 function showWaiting(sessions) {
   if (!sessions || !sessions.length) { $("waiting").innerHTML = ""; return; }  // no session watched (state/sessions.json)
   const now = Date.now() / 1000;
@@ -268,7 +270,7 @@ function showWaiting(sessions) {
   // what the session may not know: its project's jobs that no task watches (they won't wake it), results nobody has seen
   const noteText = n => n.unwatched ? `${n.name} ${n.what}, ${n.elsewhere ? "no task of this session watches it" : "nobody watches it"}`
     : `${n.name} ${n.what}${n.what === "failed" && n.exit != null ? " (exit " + n.exit + ")" : ""} at ${t(n.finished)}, nobody has seen the result`;
-  const notes = x => (x.notes || []).map(n => `<div class="why">${esc(noteText(n))}</div>`).join("");
+  const notes = x => (x.state === "waiting" ? afterTurn(x) : x.notes || []).map(n => `<div class="why">${esc(noteText(n))}</div>`).join("");
   $("waiting").innerHTML = `<h2>Waiting for you</h2>${waiting.length ? `<table>
     <tr><th>Session</th><th>State</th><th>Since</th><th class="hide-sm">Background</th></tr>
     ${waiting.map(x => `<tr><td>${name(x)}</td>
@@ -341,7 +343,7 @@ const notifyWaiting = sessions => {
   if (!notifyOn() || !("Notification" in window) || Notification.permission !== "granted") return;
   for (const x of fresh) {
     const n = new Notification(`${x.project} ${WAIT_LABEL[x.state] || "waiting for you"}`, {tag: "rq-session-" + x.project,
-      body: [x.tool || "", ...(x.notes || []).map(m => m.name + " " + m.what)].filter(Boolean).join(" · ")});
+      body: [x.tool || "", ...(x.state === "waiting" ? afterTurn(x) : []).map(m => m.name + " " + m.what)].filter(Boolean).join(" · ")});
     n.onclick = () => { window.focus(); if (x.link) location.href = x.link; n.close(); };
   }
 };

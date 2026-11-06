@@ -1329,10 +1329,15 @@ def session_states(found=None):
                 state = "question"
             elif since and now - since > 30 and not shells:
                 state = "permission"
+        # after_turn: a result that ended after the session's last turn did, so it can't know it; one that ended
+        # while the session still worked, it may have read another way (its outputs, rq status), so that one alone
+        # doesn't make the session wait for the user (kept last, so the 6 shown include these)
+        ns = sorted(({**n, "after_turn": bool(n.get("unseen") and since and (n.get("finished") or 0) > since)}
+                     for n in notes.get(project, [])), key=lambda n: n["after_turn"])
         states.append({"project": project, "state": state, "since": since, "link": links.get(project),
                        "background": len(shells) if state == "waiting" else 0,
                        "tool": tool.get("name") if tool and state == "permission" else None,
-                       "jobs": jobs.get(project), "notes": notes.get(project, [])[-6:]})
+                       "jobs": jobs.get(project), "notes": ns[-6:]})
     return states
 
 
