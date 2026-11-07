@@ -294,7 +294,8 @@ Tags say who sees a job (hover over one for more):
   again. **unwatched · session ended**: the session that queued it doesn't run any more (archived or closed); unless
   you still want the result, have the queue session cancel it.
 - **unseen**: a job that ended in the last 24 hours whose result hasn't reached the session that queued it (no
-  task of that session showed it). That session gets it with `rq mine` or `rq wait ID`.
+  task of that session showed it). A job that session cancelled itself (`rq cancel` from it, or `--replace`) doesn't
+  count. That session gets it with `rq mine` or `rq wait ID`.
 - **supervisor gone**: the job runs on without its rq supervisor (killed or crashed); it keeps its turn until its
   processes end and is then recorded as lost.
 - A lost, cancelled or failed job shows why under its name (the full reason is in its sheet), for example "the Mac

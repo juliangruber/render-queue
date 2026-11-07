@@ -2560,7 +2560,9 @@ def cancel_job(job, reason):
     rq supervisor is there to send them (never to a process group that isn't the job's any more, see job_group).
     Its owner records the end. Returns the PermissionError if its processes could not be signalled from here, else
     None."""
-    update_job(job["id"], only_if=lambda j: j["status"] not in TERMINAL, cancel_reason=reason)
+    # cancelled_by: the session that cancelled it (None from a terminal), see unseen
+    update_job(job["id"], only_if=lambda j: j["status"] not in TERMINAL, cancel_reason=reason,
+               cancelled_by=os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
     set_flag(job["id"], "cancel")
     job = load_job(job["id"]) or job
     if from_earlier_boot(job) or ((job.get("v") or 1) >= 2 and owner_alive(job)):
@@ -3114,6 +3116,8 @@ def unseen(job, now):
         return False
     if job.get("cancel_reason") == "rq run --replace":
         return False  # its session replaced it itself
+    if job["status"] == "cancelled" and job.get("cancelled_by") and job["cancelled_by"] == submitter_sid(job):
+        return False  # its own session cancelled it (a task or script of it): no news to it
     if (job.get("v") or 1) >= 2:
         return not job.get("watched_at_end") or now - (job.get("finished") or 0) > UNSEEN_GRACE
     # an older client's job: its client showed the result, unless the dispatcher closed it. A lost record of an
