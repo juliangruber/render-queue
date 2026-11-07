@@ -71,6 +71,12 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   Light jobs run one at a time next to the heavy job (two at a time while no heavy job runs), at a lower CPU
   priority (nice 10), so one may wait for its turn. A light job or still that runs past 5 minutes while other work is waiting is paused and moved into the
   queue, and continues when it's its turn.
+- A measurement that needs the machine to itself (render timing, GPU load) goes through
+  `rq run --exclusive --name NAME --estimate 40m ... -- COMMAND`. It starts once no light job or still runs, and
+  none starts beside it while its estimate lasts, so estimate generously, but it holds up everyone else: at most
+  2h, and only for measurements. Past its estimate it runs on as an ordinary heavy job (its output says so), so
+  a run that outlasts it may not be clean. Use it only for the measuring runs themselves, not for the renders
+  around them.
 - Never run renders, Blender, ffmpeg or other heavy work outside rq: it holds up the whole queue.
 - Tell the user the job id when you queue a job. `rq status` shows its position and expected times; the status page
   is http://localhost:8642.
