@@ -27,6 +27,8 @@ whose turn it is and serves the status page.
   rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
   rq keep ID                (when the user says so: a light job or still may run longer than 5 min)
+  rq keep --match 'PROJECT/NAME*' --until 08:00 | --for 10h   (the same for the matching jobs until then;
+                            rq keep lists the rules, --off ends one)
   rq start [--port 8642]    (start the dispatcher and status page detached, once per machine)
   rq daemon [--port 8642]   (the same in the foreground)
 
@@ -57,6 +59,7 @@ exits 0 once the job is submitted.
 import argparse
 import contextlib
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import html
@@ -98,6 +101,7 @@ side = lambda j: j.get("kind") in SIDE  # a light job or a still, not (or no lon
 SLOTS = {"light": [GRANT_LIGHT, GRANT_LIGHT_2], "still": [GRANT_STILL]}
 turn_paths = lambda kind: SLOTS.get(kind, [GRANT])
 ORDER = os.path.join(STATE, "order.json")
+KEEP_RULES = os.path.join(STATE, "keep.json")  # rq keep --match: [{match, until, added}]
 DISPATCHER = os.path.join(STATE, "dispatcher.json")
 ROOT = os.path.realpath(os.environ.get("RQ_ROOT") or os.path.dirname(HOME))  # the folder that holds the projects
 ROOT_DASHED = re.sub(r"[^A-Za-z0-9]", "-", ROOT)  # as Claude Code names scratchpad and transcript folders
@@ -936,7 +940,7 @@ def snapshot():
                      "estimate": hold.get("estimate"),
                      "waits_for": [] if hold["status"] != "queued" else
                      ["%s/%s" % (j["project"], j["name"]) for j in side_running({j["id"]: j for j in jobs})]}
-    return {"now": now, "exclusive": exclusive, "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
+    return {"now": now, "exclusive": exclusive, "keep": keep_rules(now), "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
             "light": [public(j) for j in light], "light_queued": [public(j) for j in light_queued],
             "still": [public(j) for j in still], "still_queued": [public(j) for j in still_queued],
             "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now,
@@ -2064,6 +2068,38 @@ def end_exclusive(jobs):
                 pass
 
 
+def keep_rules(now=None):
+    """The rq keep --match rules still in force."""
+    now = now or time.time()
+    return [r for r in read_json(KEEP_RULES, []) or [] if (r.get("until") or 0) > now]
+
+
+def keep_match(job, rules):
+    return next((r for r in rules if fnmatch.fnmatchcase("%s/%s" % (job.get("project"), job.get("name")), r["match"])),
+                None)
+
+
+def apply_keep(jobs):
+    """rq keep --match: a light job or still (also one the cap moved into the queue) whose PROJECT/NAME matches a rule
+    in force gets the keep flag, as with rq keep ID, noted once in its output."""
+    rules = keep_rules()
+    if not rules:
+        return
+    for job in jobs.values():
+        if job["status"] in TERMINAL or not (side(job) or job.get("was") in SIDE) or has_flag(job["id"], "keep"):
+            continue
+        rule = keep_match(job, rules)
+        if rule:
+            set_flag(job["id"], "keep")
+            try:
+                with open(os.path.join(LOGS, job["id"] + ".log"), "a") as f:
+                    f.write("[rq %s] it may run longer than %s without being paused (rq keep --match %s, until %s)\n"
+                            % (time.strftime("%H:%M:%S"), fmt_duration(LIGHT_CAP), rule["match"],
+                               fmt_time(rule["until"])))
+            except OSError:
+                pass
+
+
 def dispatch_side(jobs, kind, hold=False):
     """A side queue (light jobs, or stills): one job of its kind at a time, in queue order; the light queue two
     while no job has the main turn (a second one that started then runs on when a job gets it). A running one
@@ -2273,6 +2309,7 @@ def dispatch_once(state):
         sweep(jobs)
         repair_grants(jobs)
         end_exclusive(jobs)
+        apply_keep(jobs)
         dispatch_main(state, jobs)  # (first: a job it grants the main turn leaves the light queue one turn)
         hold = bool(exclusive_hold(jobs))
         for kind in SIDE:
@@ -3677,11 +3714,54 @@ def cmd_estimate(args):
 
 
 def cmd_keep(args):
+    if args.match or not args.id:
+        return keep_rule(args)
     job = find_job(args.id)
-    if not side(job) or job["status"] in TERMINAL:
-        sys.exit("rq: %s isn't a running light job or still" % job["id"])
+    if job["status"] in TERMINAL or not (side(job) or job.get("was") in SIDE):
+        sys.exit("rq: %s isn't a light job or still" % job["id"])
     set_flag(job["id"], "keep")
     print("rq: %s may run on as %s, past the cap" % (job["id"], side_words(job)))
+
+
+def keep_rule(args):
+    """rq keep --match PATTERN --until HH:MM | --for DURATION: the light jobs and stills whose PROJECT/NAME matches the
+    glob may run past the cap while the rule lasts (the dispatcher flags them); --off ends it; no arguments lists them."""
+    now = time.time()
+    if not args.match:
+        rules = keep_rules(now)
+        for r in rules:
+            print("%s  until %s" % (r["match"], time.strftime("%a %H:%M", time.localtime(r["until"]))))
+        if not rules:
+            print("rq: no rq keep --match rules")
+        return
+    if "/" not in args.match:
+        sys.exit("rq: --match takes PROJECT/NAME, a glob: 'gewalt/*-inst-cgrun*'")
+    until = None
+    if args.off:
+        pass
+    elif args.until:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", args.until.strip())
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            sys.exit("rq: --until takes a time of day, HH:MM")
+        t = time.localtime(now)
+        until = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, -1))
+        if until <= now:  # (the next one: tomorrow's)
+            t = time.localtime(now + 86400)
+            until = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, -1))
+    elif args.for_:
+        until = now + (parse_duration(args.for_) or sys.exit("rq: --for takes a duration, 10h"))
+    else:
+        sys.exit("rq: --match needs --until HH:MM or --for DURATION (or --off)")
+    with jobs_lock():
+        rules = [r for r in keep_rules(now) if r["match"] != args.match]
+        if until:
+            rules.append({"match": args.match, "until": until, "added": now})
+        write_json(KEEP_RULES, rules)
+    if until:
+        print("rq: light jobs and stills matching %s may run longer than %s until %s"
+              % (args.match, fmt_duration(LIGHT_CAP), time.strftime("%a %H:%M", time.localtime(until))))
+    else:
+        print("rq: no rule for %s any more (jobs it already exempted run on)" % args.match)
 
 
 def cmd_move(args):
@@ -3768,6 +3848,9 @@ def cmd_status(args):
             "exclusive %s/%s runs alone until ~%s" % (x["project"], x["name"], fmt_time(x["until"])) if x["running"]
             else "exclusive %s/%s is next%s" % (x["project"], x["name"], ", once %s ended" % ", ".join(x["waits_for"])
                                                   if x["waits_for"] else "")))
+    for i, r in enumerate(snap.get("keep") or []):
+        print("%skeep:     light jobs and stills matching %s run past the cap until %s" % ("" if i else "\n", r["match"],
+                                                                                         fmt_time(r["until"])))
     for i, j in enumerate(snap["light"]):  # (two while the main queue runs nothing)
         print("%slight:    %s  %s/%s  %s elapsed%s" % ("" if i else "\n", j["id"], j["project"], j["name"],
                                                      fmt_duration(j["elapsed"]), seen(j)))
@@ -4045,8 +4128,14 @@ def main():
     sup.add_argument("--sig", type=int)
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
-    for name in ("cancel", "pause", "resume", "keep"):
+    for name in ("cancel", "pause", "resume"):
         sub.add_parser(name).add_argument("id")
+    k = sub.add_parser("keep")
+    k.add_argument("id", nargs="?")
+    k.add_argument("--match")
+    k.add_argument("--until")
+    k.add_argument("--for", dest="for_")
+    k.add_argument("--off", action="store_true")
     m = sub.add_parser("move")
     m.add_argument("id")
     m.add_argument("where", choices=["first", "queue"])

@@ -77,6 +77,7 @@ From then on you tell the queue session what to change, and it runs:
 | --- | --- |
 | "go" for a queued job | `rq move ID first` (it runs next) |
 | a running light job or still may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
+| the light jobs and stills of a step tonight may run longer | `rq keep --match 'gewalt/*-inst-cgrun*' --until 09:00` |
 | a job will take longer or shorter | `rq estimate ID 2h` |
 | stop a job | `rq cancel ID` |
 | hold a running job, keeping its turn | `rq pause ID`, later `rq resume ID` |
@@ -236,7 +237,10 @@ prompt, it tells the session which of its jobs no task watches and which results
   waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
   and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status
   page marks it "paused · was light"). `rq keep ID` before the 5 minutes are up lets it run on; once it is paused,
-  `rq move ID first` makes it the next job. The 5 minutes are running time: while `rq pause` holds a light job, it
+  `rq move ID first` makes it the next job. For jobs that aren't queued yet, `rq keep --match 'PROJECT/NAME*'
+  --until HH:MM` (or `--for 10h`) does the same for every light job and still whose project/name matches the glob
+  while the rule lasts: the dispatcher flags each one and notes it in its output. `rq keep` lists the rules,
+  `rq status` shows them, `--off` ends one. The 5 minutes are running time: while `rq pause` holds a light job, it
   isn't moved, and a job that `rq pause` holds when its turn comes keeps its turn and stays paused until
   `rq resume ID`.
 - **Work outside the queue:** a busy or paused Blender or ffmpeg anywhere on the machine, or any other process group
@@ -270,6 +274,7 @@ rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its
 rq move ID first             (when the user says go: this queued job runs next)
 rq move ID queue             (pause a running light job or still, move it to the end of the main queue)
 rq keep ID                   (when the user says so: this light job or still may run longer than 5 minutes)
+rq keep --match 'P/NAME*' --until 09:00   (the same for the matching jobs until then; --for 10h, --off)
 rq estimate ID 90m           (set or correct a job's expected duration)
 rq start [--port 8642]       (start the dispatcher and the status page detached, one per machine)
 rq daemon [--port 8642]      (the same in the foreground)
