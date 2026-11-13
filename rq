@@ -17,7 +17,8 @@ whose turn it is and serves the status page.
          -- COMMAND [ARGS...]   (light work: the light queue, one at a time (two while the main queue runs
                                 nothing), at nice 10)
   rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace]
-         -- COMMAND [ARGS...]   (stills: the stills queue, one at a time, at nice 10, next to the light queue)
+         -- COMMAND [ARGS...]   (stills: the stills queue, one at a time, more while the main or the
+                                light queue is empty, at nice 10)
   rq wait ID [-n LINES]     (watch a job again: its output from here, then its exit code; at once if it ended)
   rq mine [--unwatched] [--hook]   (this session's jobs no task of it watches, results that didn't reach it)
   rq status [--json]
@@ -93,12 +94,16 @@ WATCH = os.path.join(STATE, "watch")  # per watcher: ID.PID.json, flocked by the
 GRANT = os.path.join(STATE, "grant")
 GRANT_LIGHT = os.path.join(STATE, "grant-light")  # the light queue's turn: one light job at a time
 GRANT_LIGHT_2 = os.path.join(STATE, "grant-light-2")  # its second turn, while no job has the main turn
-GRANT_STILL = os.path.join(STATE, "grant-still")  # the stills queue's turn: one still at a time
+GRANT_STILL = os.path.join(STATE, "grant-still")  # the stills queue's first turn
+# its further turns: one while the main queue is empty, the light queue's (one or two) while that is empty
+GRANTS_STILL_MORE = [os.path.join(STATE, "grant-still-%d" % i) for i in (2, 3, 4)]
 # the side queues next to the main queue, by job kind: each runs one job at a time, at low priority, under the cap
 SIDE = {"light": GRANT_LIGHT, "still": GRANT_STILL}
 side = lambda j: j.get("kind") in SIDE  # a light job or a still, not (or no longer) in the main queue
 # the turn files a job of a kind may get: the main queue's, a side queue's, and the light queue's second
-SLOTS = {"light": [GRANT_LIGHT, GRANT_LIGHT_2], "still": [GRANT_STILL]}
+SLOTS = {"light": [GRANT_LIGHT, GRANT_LIGHT_2], "still": [GRANT_STILL] + GRANTS_STILL_MORE}
+# any_slot a supervisor must have written for a turn past a queue's first: 2 knows the stills' further turns
+SLOT_NEEDS = {"light": 1, "still": 2}
 turn_paths = lambda kind: SLOTS.get(kind, [GRANT])
 ORDER = os.path.join(STATE, "order.json")
 KEEP_RULES = os.path.join(STATE, "keep.json")  # rq keep --match: [{match, until, added}]
@@ -2102,10 +2107,11 @@ def apply_keep(jobs):
 
 def dispatch_side(jobs, kind, hold=False):
     """A side queue (light jobs, or stills): one job of its kind at a time, in queue order; the light queue two
-    while no job has the main turn (a second one that started then runs on when a job gets it). A running one
-    (also a light job started before this queue existed) holds a slot; one that ran over the cap and moved into the
-    main queue frees it. The second turn goes only to a job whose supervisor looks for it (any_slot: an older one
-    looks only at the first)."""
+    while no job has the main turn; stills one more while the main queue is empty (nothing running or queued) and
+    the light queue's turns (one, or two) while that is empty. A job that started on such a turn runs on when work
+    comes to the queue it borrowed from. A running one (also a light job started before this queue existed) holds
+    a slot; one that ran over the cap and moved into the main queue frees it. A further turn goes only to a job
+    whose supervisor looks for it (any_slot, SLOT_NEEDS: an older one looks only at the first)."""
     paths, held = SLOTS[kind], set()
     for path in paths:
         turn = granted(path)
@@ -2119,14 +2125,20 @@ def dispatch_side(jobs, kind, hold=False):
         return
     busy = held | {j["id"] for j in jobs.values() if j.get("kind") == kind and j["status"] in ("granted", "running")}
     main = jobs.get(granted(GRANT) or "")
-    room = 1 if main and main["status"] not in TERMINAL else len(paths)
+    main = bool(main and main["status"] not in TERMINAL)
+    if kind == "light":
+        room = 1 if main else len(paths)
+    else:
+        empty = lambda of: not any(of(j) and j["status"] in ("queued", "granted", "running") for j in jobs.values())
+        room = 1 + (not main and empty(lambda j: not side(j))) \
+            + ((1 if main else len(SLOTS["light"])) if empty(lambda j: j.get("kind") == "light") else 0)
     if len(busy) >= room:
         return
     waiting = queue_order([j for j in jobs.values() if j.get("kind") == kind and j["status"] == "queued"
                            and waits(j)])
     for job in waiting[:room - len(busy)]:
         path = next((p for p in paths if not granted(p)), None)
-        if not path or (path != paths[0] and not job.get("any_slot")):
+        if not path or (path != paths[0] and (job.get("any_slot") or 0) < SLOT_NEEDS[kind]):
             return  # (in queue order: a job that can't take this turn waits for the first)
         # the record first: its client may start as soon as the turn file names it
         new = update_job(job["id"], only_if=lambda j: j["status"] == "queued" and j.get("kind") == kind
@@ -3298,10 +3310,10 @@ def cmd_supervise(args):
     me = {"pid": os.getpid(), "start": proc_start(os.getpid())}
     # any_slot: this supervisor (and its waiter) look at every turn file of the job's kind, see dispatch_side
     if args.waited:  # the job's owner already: this very process (an exec keeps the pid)
-        job = update_job(job_id, only_if=lambda j: (j.get("owner") or {}).get("pid") == os.getpid(), any_slot=True)
+        job = update_job(job_id, only_if=lambda j: (j.get("owner") or {}).get("pid") == os.getpid(), any_slot=2)
     else:  # (the dispatcher may have granted it already: it can do that as soon as the record exists)
         job = update_job(job_id, only_if=lambda j: (j.get("v") or 1) >= 2 and j["status"] in ("queued", "granted")
-                         and not j.get("owner"), owner=me, client_pid=os.getpid(), any_slot=True)
+                         and not j.get("owner"), owner=me, client_pid=os.getpid(), any_slot=2)
     if not job:
         say("rq supervisor of %s: not starting, the job is %s" % (job_id, (load_job(job_id) or {}).get("status")))
         sup.release()
@@ -3858,9 +3870,9 @@ def cmd_status(args):
         print("\nlight queue:")
         for i, j in enumerate(snap["light_queued"], 1):
             print("  %d. %s  %s/%s%s" % (i, j["id"], j["project"], j["name"], seen(j)))
-    for j in snap["still"]:
-        print("\nstill:    %s  %s/%s  %s elapsed%s" % (j["id"], j["project"], j["name"], fmt_duration(j["elapsed"]),
-                                                     seen(j)))
+    for i, j in enumerate(snap["still"]):  # (more while the main or the light queue is empty)
+        print("%sstill:    %s  %s/%s  %s elapsed%s" % ("" if i else "\n", j["id"], j["project"], j["name"],
+                                                     fmt_duration(j["elapsed"]), seen(j)))
     if snap["still_queued"]:
         print("\nstills queue:")
         for i, j in enumerate(snap["still_queued"], 1):
@@ -4087,8 +4099,8 @@ def main():
     for name, text in (("run", "queue a heavy job; its own rq supervisor runs it on its turn; watch its output"),
                        ("light", "queue a light job: one at a time (two while the main queue runs nothing), at low "
                                  "priority, next to the main queue"),
-                       ("still", "queue a still (pictures only, under 5 min): the stills queue, one at a time, at "
-                                 "low priority, next to the main and the light queue")):
+                       ("still", "queue a still (pictures only, under 5 min): the stills queue, one at a time (more while "
+                                 "the main or the light queue is empty), at low priority, next to them")):
         r = sub.add_parser(name, help=text, description=text)
         r.add_argument("--name", required=True)
         r.add_argument("--project", help="the project's folder name in the projects folder (default: from the "

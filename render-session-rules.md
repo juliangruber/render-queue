@@ -63,8 +63,8 @@ the CLAUDE.md that imports this file names both. When the queue session says the
 - Stills under 5 minutes (rendering one or a few pictures: a still frame, a contact sheet, a look page's stills)
   go through `rq still`, also as a background task:
   `rq still --name NAME --output stills/shot.png -- COMMAND`
-  Stills have their own queue, one at a time next to the heavy job and the light job, at nice 10, so a still
-  renders even while the light queue is busy. A still needs `--output` for the pictures it writes (a file, a frame
+  Stills have their own queue, one at a time next to the heavy job and the light job (more at a time while the
+  main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. A still needs `--output` for the pictures it writes (a file, a frame
   pattern or a folder); rq refuses `--no-output` and video files (exit 64): those go through `rq light`.
 - Other light work under 5 minutes (tests, previews, short encodes, analyses) goes through `rq light`, also as a
   background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
