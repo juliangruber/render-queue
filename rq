@@ -24,6 +24,8 @@ whose turn it is and serves the status page.
   rq status [--json]
   rq log ID [-n LINES] [-f]
   rq cancel ID | rq pause ID | rq resume ID
+                            (rq resume of a light job or still the cap moved into the queue, when the user
+                            says let it run: it continues now, past the cap)
   rq move ID first          (when the user says go: put a queued job next in line)
   rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
@@ -3695,6 +3697,8 @@ def cmd_pause(args, pause=True):
     """rq pause / rq resume: SIGSTOP or SIGCONT to a running job's processes (only while they are still its own,
     see job_group), its paused flag and its stopped intervals, under the jobs lock (the light cap takes it too)."""
     job = find_job(args.id)
+    if not pause and job["status"] == "queued" and job.get("was") in SIDE:
+        return resume_moved(job)
     with jobs_lock():
         job = load_job(job["id"]) or job
         group = job_group(job) if job["status"] == "running" else None
@@ -3709,6 +3713,34 @@ def cmd_pause(args, pause=True):
         set_flag(job["id"], "paused", pause)
         update_job(job["id"], stopped=open_stop if pause else close_stop)
     print("rq: %s %s (it keeps its turn)" % ("paused" if pause else "resumed", job["id"]))
+
+
+def resume_moved(job):
+    """rq resume ID for a light job or still that the cap (or rq move ID queue) paused and moved into the main queue,
+    when the user says let it run: it continues now, as what it was, beside whatever runs, and past the cap (keep).
+    The record first, under the jobs lock, so its supervisor sees a running job it must not cap, then SIGCONT."""
+    with jobs_lock():
+        job = load_job(job["id"]) or job
+        group = job_group(job) if job["status"] == "queued" and job.get("was") in SIDE else None
+        if not group:
+            sys.exit("rq: %s isn't paused in the queue" % job["id"])
+        set_flag(job["id"], "keep")
+        set_flag(job["id"], "paused", False)
+        now = time.time()
+        if not update_job(job["id"], only_if=lambda j: j["status"] == "queued", kind=job["was"], status="running",
+                          promoted=None, resumed=now, stopped=lambda j: close_stop(j, now)):
+            sys.exit("rq: %s has just changed; look again with rq status" % job["id"])
+        try:
+            signal_group(group, signal.SIGCONT)
+        except PermissionError as e:
+            sys.exit("rq: could not continue %s: %s" % (job["id"], e.strerror or e))
+    try:
+        with open(os.path.join(LOGS, job["id"] + ".log"), "a") as f:
+            f.write("[rq %s] continuing (rq resume): it runs on as %s, past the cap\n"
+                    % (time.strftime("%H:%M:%S"), side_words({"kind": job["was"]})))
+    except OSError:
+        pass
+    print("rq: %s continues as %s, past the cap" % (job["id"], side_words({"kind": job["was"]})))
 
 
 def cmd_estimate(args):

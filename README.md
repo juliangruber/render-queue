@@ -77,6 +77,7 @@ From then on you tell the queue session what to change, and it runs:
 | --- | --- |
 | "go" for a queued job | `rq move ID first` (it runs next) |
 | a running light job or still may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
+| let a light job or still the cap paused and moved into the queue run now | `rq resume ID` (it continues at once, past the cap) |
 | the light jobs and stills of a step tonight may run longer | `rq keep --match 'gewalt/*-inst-cgrun*' --until 09:00` |
 | a job will take longer or shorter | `rq estimate ID 2h` |
 | stop a job | `rq cancel ID` |
@@ -240,7 +241,8 @@ prompt, it tells the session which of its jobs no task watches and which results
   waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
   and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status
   page marks it "paused · was light"). `rq keep ID` before the 5 minutes are up lets it run on; once it is paused,
-  `rq move ID first` makes it the next job. For jobs that aren't queued yet, `rq keep --match 'PROJECT/NAME*'
+  `rq resume ID` continues it at once as what it was, beside whatever runs and past the cap, and `rq move ID first`
+  makes it the next job. For jobs that aren't queued yet, `rq keep --match 'PROJECT/NAME*'
   --until HH:MM` (or `--for 10h`) does the same for every light job and still whose project/name matches the glob
   while the rule lasts: the dispatcher flags each one and notes it in its output. `rq keep` lists the rules,
   `rq status` shows them, `--off` ends one. The 5 minutes are running time: while `rq pause` holds a light job, it
@@ -274,7 +276,8 @@ rq mine [--unwatched] [--hook]   (this session's jobs no task of it watches, res
 rq status [--json]           (also: jobs nobody watches, results nobody has seen, with their ids)
 rq log ID [-n 40] [-f]
 rq cancel ID
-rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its turn)
+rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its turn. rq resume of a light job or
+                             still the cap moved into the queue continues it now, past the cap)
 rq move ID first             (when the user says go: this queued job runs next)
 rq move ID queue             (pause a running light job or still, move it to the end of the main queue)
 rq keep ID                   (when the user says so: this light job or still may run longer than 5 minutes)
