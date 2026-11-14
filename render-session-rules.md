@@ -60,16 +60,17 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   so later edits don't change a queued job. From a snapshot outside the project folder, pass `--project NAME` (the
   project's folder name), and have the job write its pictures and videos into the project folder or its
   scratchpad, declared by their absolute paths.
-- Stills under 5 minutes (rendering one or a few pictures: a still frame, a contact sheet, a look page's stills)
+- Stills (rendering one or a few pictures: a still frame, a contact sheet, a look page's stills)
   go through `rq still`, also as a background task:
   `rq still --name NAME --output stills/shot.png -- COMMAND`
   Stills have their own queue, one at a time next to the heavy job and the light job (more at a time while the
-  main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. A still needs `--output` for the pictures it writes (a file, a frame
-  pattern or a folder); rq refuses `--no-output` and video files (exit 64): those go through `rq light`.
+  main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. Stills
+  have no time limit. A still needs `--output` for the pictures it writes (a file, a frame pattern or a folder); rq
+  refuses `--no-output` and video files (exit 64): those go through `rq light`.
 - Other light work under 5 minutes (tests, previews, short encodes, analyses) goes through `rq light`, also as a
   background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
   Light jobs run one at a time next to the heavy job (two at a time while no heavy job runs), at a lower CPU
-  priority (nice 10), so one may wait for its turn. A light job or still that runs past 5 minutes while other work is waiting is paused and moved into the
+  priority (nice 10), so one may wait for its turn. A light job that runs past 5 minutes while other work is waiting is paused and moved into the
   queue, and continues when it's its turn.
 - A measurement that needs the machine to itself (render timing, GPU load) goes through
   `rq run --exclusive --name NAME --estimate 40m ... -- COMMAND`. It starts once no light job or still runs, and
@@ -82,7 +83,7 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   is http://localhost:8642.
 - Don't wait for other sessions, read their transcripts or check their processes: the queue does that.
 - Don't reorder the queue yourself. If the user says "go" for a job, ask the queue session to move it first (or tell
-  the user to). Only the user decides whether a light job or still may run longer than 5 minutes.
+  the user to). Only the user decides whether a light job may run longer than 5 minutes.
 - Pause or stop only your own processes, by exact PID, and leave no processes behind when a job is done. rq's
   processes (`rq _supervise ID` and the job under it) belong to rq even after your session restarts. Never kill
   them; use `rq cancel ID`.

@@ -29,7 +29,7 @@ whose turn it is and serves the status page.
   rq move ID first          (when the user says go: put a queued job next in line)
   rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
-  rq keep ID                (when the user says so: a light job or still may run longer than 5 min)
+  rq keep ID                (when the user says so: a light job may run longer than 5 min)
   rq keep --match 'PROJECT/NAME*' --until 08:00 | --for 10h   (the same for the matching jobs until then;
                             rq keep lists the rules, --off ends one)
   rq start [--port 8642]    (start the dispatcher and status page detached, once per machine)
@@ -3484,7 +3484,7 @@ class Supervisor:
             self.kill_at = min(self.kill_at or now + STOP_KILL, now + STOP_KILL)
 
     def light_step(self, pgid):
-        """A light job: past LIGHT_CAP of running time (rq pause time left out) while other work is active, pause it
+        """A light job (a still has no cap): past LIGHT_CAP of running time (rq pause time left out) while other work is active, pause it
         and move it into the main queue as a heavy job; alone, or with rq keep ID or rq pause ID, it runs on. Paused
         in the queue (after the cap, or rq move ID queue), continue it once the dispatcher grants it the main turn.
         An error (a full disk, say) is logged and the step tried again; it never leaves the job stopped by itself."""
@@ -3499,7 +3499,7 @@ class Supervisor:
                     self.continue_turn(pgid)
                 return
             now = time.time()
-            if job["status"] != "running" or not side(job) or now < self.next_cap:
+            if job["status"] != "running" or job.get("kind") != "light" or now < self.next_cap:  # (stills: no cap)
                 return
             self.next_cap = now + 2
             if has_flag(self.id, "keep") or has_flag(self.id, "paused") or (run_time(job, now) or 0) < LIGHT_CAP:
@@ -3524,7 +3524,7 @@ class Supervisor:
         now = time.time()
         with jobs_lock():
             job = load_job(self.id)
-            if not job or job["status"] != "running" or not side(job) or self.proc.poll() is not None \
+            if not job or job["status"] != "running" or job.get("kind") != "light" or self.proc.poll() is not None \
                     or self.sig["n"] or any(has_flag(self.id, k) for k in ("keep", "paused", "cancel")):
                 return
             if not signal_group(pgid, signal.SIGSTOP):
@@ -4131,7 +4131,7 @@ def main():
     for name, text in (("run", "queue a heavy job; its own rq supervisor runs it on its turn; watch its output"),
                        ("light", "queue a light job: one at a time (two while the main queue runs nothing), at low "
                                  "priority, next to the main queue"),
-                       ("still", "queue a still (pictures only, under 5 min): the stills queue, one at a time (more while "
+                       ("still", "queue a still (pictures only, no time limit): the stills queue, one at a time (more while "
                                  "the main or the light queue is empty), at low priority, next to them")):
         r = sub.add_parser(name, help=text, description=text)
         r.add_argument("--name", required=True)

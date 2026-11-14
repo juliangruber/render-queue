@@ -76,7 +76,7 @@ From then on you tell the queue session what to change, and it runs:
 | You say | It runs |
 | --- | --- |
 | "go" for a queued job | `rq move ID first` (it runs next) |
-| a running light job or still may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
+| a running light job may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
 | let a light job or still the cap paused and moved into the queue run now | `rq resume ID` (it continues at once, past the cap) |
 | the light jobs and stills of a step tonight may run longer | `rq keep --match 'gewalt/*-inst-cgrun*' --until 09:00` |
 | a job will take longer or shorter | `rq estimate ID 2h` |
@@ -228,8 +228,8 @@ prompt, it tells the session which of its jobs no task watches and which results
   nothing running or queued, and the light queue's (one next to a heavy job, two without) while it has none, so up
   to four stills at a time on an otherwise idle machine. A still that started on a borrowed turn runs on when work
   comes to that queue. A still writes pictures (a picture, a frame pattern or a folder of pictures): it needs `--output`, and
-  rq refuses `--no-output` and a video file (exit 64). The 5 minute cap below applies to stills the same way, with
-  another still waiting or a heavy job active (the page marks a moved one "paused · was a still").
+  rq refuses `--no-output` and a video file (exit 64). Stills have no time limit: the 5 minute cap below is for light
+  work only.
 - **Exclusive jobs** (`rq run --exclusive`) are for measurements (render timing, GPU load) that need the machine to
   themselves. One waits in the main queue like any heavy job. Once it is next and nobody has the main turn, no
   light job or still starts any more, and it starts when the light jobs and stills running then have ended (and
@@ -280,7 +280,7 @@ rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its
                              still the cap moved into the queue continues it now, past the cap)
 rq move ID first             (when the user says go: this queued job runs next)
 rq move ID queue             (pause a running light job or still, move it to the end of the main queue)
-rq keep ID                   (when the user says so: this light job or still may run longer than 5 minutes)
+rq keep ID                   (when the user says so: this light job may run longer than 5 minutes)
 rq keep --match 'P/NAME*' --until 09:00   (the same for the matching jobs until then; --for 10h, --off)
 rq estimate ID 90m           (set or correct a job's expected duration)
 rq start [--port 8642]       (start the dispatcher and the status page detached, one per machine)
