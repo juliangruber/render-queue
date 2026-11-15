@@ -3,10 +3,10 @@
 `rq` lets several [Claude Code](https://claude.com/claude-code) sessions share one Mac for rendering, each working on
 its own project. Heavy jobs run strictly one at a time, first come first served. Short light jobs and stills run
 next to them at low priority, each in its own queue. A
-local status page shows the queue with expected start and end times, the CPU cores each project uses, the GPU load and
-which sessions are waiting for you.
+local status page shows the queue with expected start and end times, the CPU cores each project uses and the GPU
+load.
 
-![The status page: sessions waiting for you, CPU and GPU use per project, the job rendering now next to a light job, the queue with expected start and end times, the light queue, and recent jobs with how many outputs each declared](docs/status.png)
+![The status page: CPU and GPU use per project, the job rendering now next to a light job, the queue with expected start and end times, the light queue, and recent jobs with how many outputs each declared](docs/status.png)
 
 ## Setup
 
@@ -19,7 +19,7 @@ of starting them itself.
 - macOS. rq uses `caffeinate` (keeps the Mac awake while a job runs), `ioreg` (GPU load, no admin rights needed),
   `lsof` and `ps` (which project a process belongs to, work outside the queue) and `/bin/zsh` (runs job commands).
 - Python 3 at `/usr/bin/python3` (it comes with the Xcode Command Line Tools), standard library only.
-- Claude Code. The "Waiting for you" list reads the sessions' transcripts under `~/.claude/projects/`.
+- Claude Code.
 
 ### Folder layout
 
@@ -51,25 +51,18 @@ A Claude Code session in the `render-queue` folder. It runs no renders itself.
 2. It starts the dispatcher: `./rq start`. The dispatcher runs detached, so it outlives the session that started it,
    and only one can run at a time. After a restart of the Mac, start it again.
 3. Open the status page: http://localhost:8642 (local only; `rq start --port N` for another port).
-4. Optional, once the render sessions are running (step 2): have it write `state/sessions.json`, the sessions to
-   watch for "Waiting for you": every project folder name, with a link that opens its session if you have one (for
-   example from the Claude desktop app), else `null`:
+4. Optional: have it write `state/sessions.json`, the video projects, every project folder name (the values aren't
+   used):
 
    ```json
    {
-     "project-a": "claude://...",
+     "project-a": null,
      "project-b": null
    }
    ```
 
-   The page then shows when a session asked you a question or when a tool call may wait for your permission. A
-   session that only ended its turn isn't listed. While one of a session's tasks watches its job in the queue (`rq run` or `rq wait`), the
-   session waits for that job, not for you. A job that no task watches won't wake the session when it ends, so then
-   the session waits for you, with a note for each such job ("preview running, nobody watches it") and each result
-   nobody has seen. This works best with sessions whose process rq finds: sessions in the Claude desktop app and
-   CLI sessions (`claude --resume ID`, or `claude` started in the project folder); otherwise it reads the project's
-   newest transcript only. A watched session without a running process (archived or closed) is left out. Without
-   `sessions.json`, the page leaves "Waiting for you" out.
+   Their work outside the queue then holds it up even before they queued a job, and the page gives them their colors
+   in name order.
 
 From then on you tell the queue session what to change, and it runs:
 
@@ -89,8 +82,8 @@ From then on you tell the queue session what to change, and it runs:
 
 ### 2. The render sessions
 
-Start one Claude Code session per project, in the project's folder (that is how rq and the transcripts know which
-project a session is). The rules they follow are in `render-session-rules.md`: import that file from each project's
+Start one Claude Code session per project, in the project's folder (that is how rq knows which project a session
+is). The rules they follow are in `render-session-rules.md`: import that file from each project's
 `CLAUDE.md`, together with the two names it uses, and replace `/path/to/render-queue` with your path:
 
 ```markdown
@@ -131,7 +124,7 @@ prompt, it tells the session which of its jobs no task watches and which results
   idle session: tell it, or send it any prompt. The status page tags such a job "unwatched" while it runs, and its
   result "unseen" until the session that queued it has it.
 - Watch the status page: what renders now, the queue with expected start and end times, cores per project, the GPU,
-  work outside the queue that holds it up, and the sessions waiting for you (click one to open it).
+  and work outside the queue that holds it up.
 - Click a job under "Recent" to see what it produced: the videos, pictures and frame sequences at the outputs its
   session declared when it queued it.
 - Tell the queue session when you want to change the order or a job: "go for ID", "cancel ID", "let ID run on",
@@ -293,7 +286,7 @@ IDs can be shortened to any part that matches only one job, finished jobs includ
 
 ## Status page
 
-http://localhost:8642 shows which sessions are waiting for you, the cores each project uses (in total and per
+http://localhost:8642 shows the cores each project uses (in total and per
 project), the GPU utilization, the running job, light work and stills, the queues with expected start and end times, heavy
 work outside rq, and recent jobs with how long they ran (without the time they were paused or waiting in the
 queue; "-" when the job's owner was gone and nobody saw it end) and how many outputs they declared ("2 outputs",
@@ -316,13 +309,6 @@ Tags say who sees a job (hover over one for more):
   restarted", "rq cancel" or "its rq supervisor ended while the job was queued".
 
 The tab's icon, an old movie camera, is in color while a job runs (heavy or light) and gray while the queue is idle.
-It gets an amber dot while a session is listed under "Waiting for you": it asked a question, a tool call
-may wait for your permission, or its turn ended before results of its jobs that nobody has seen (it can't know
-them). Results that ended while the session still worked don't count, nor jobs still queued or running: the
-session may have checked them another way, and an unwatched job counts once it ends after the turn.
-
-"Notify me" under "All done" turns on browser notifications, while the page is open in a tab: when a session shows up
-under "Waiting for you" (click to open the session, if `sessions.json` has a link for it). Jobs ending don't notify.
 
 **Outputs** (http://localhost:8642/feed, linked next to the title) shows every picture, video and frame sequence the
 jobs of the last 24 hours wrote, the newest first, one under the other at full width, to catch a bug early by looking.
@@ -385,11 +371,8 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
 - rq never signals a process group that isn't a job's any more: before it pauses, continues, cancels or kills the
   processes of a job it doesn't own, it checks that the group's leader is still the process the job started (its
   pid and start time). A group whose id another process got since counts as ended.
-- Every 5 s the dispatcher reads the tail of each watched session's transcript (and checks its Claude process) to show
-  which sessions wait for you: they asked a question, a tool call may wait for permission, or their turn ended while
-  they have jobs that no task watches or results they haven't seen (a turn that only ended isn't shown). Turns
-  that only answered another session are skipped. A session one of whose tasks watches a job in rq waits for that
-  job, not for you.
+- Every 5 s the dispatcher lists the Claude Code processes (their session ids, or the project folder of one started
+  without `--resume`), so the page can tag an unwatched job whose session ended "session ended".
 - Who watches a job: every `rq run` or `rq wait` that follows one holds an flock on its file in `state/watch/`,
   which also names the Claude Code session it reports to (`CLAUDE_CODE_SESSION_ID`, and `CLAUDE_PID` with that
   process's start time). A watcher counts while it holds the lock and that Claude process runs. Whether the session

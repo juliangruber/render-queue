@@ -135,11 +135,8 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
       <h1>Render queue <a href="/feed" style="font-size:14px;font-weight:400;margin-left:8px;color:var(--accent)">Outputs</a></h1>
       <div class="sub" id="dispatcher"><span class="dot"></span>connecting…</div>
     </div>
-    <div style="text-align:right"><div class="big" id="alldone"></div>
-      <button id="notify" hidden style="margin-top:6px"></button></div>
+    <div style="text-align:right"><div class="big" id="alldone"></div></div>
   </header>
-
-  <div id="waiting"></div>
 
   <h2>CPU and GPU</h2>
   <div class="card"><div id="cores"><span class="sub">measuring…</span></div>
@@ -174,9 +171,9 @@ button.x { font-size: 20px; line-height: 1; padding: 4px 10px; }
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 const $ = id => document.getElementById(id);
-// the tab icon: an old movie camera with two film reels; an amber dot at the top while a session needs you (needsYou),
-// in color while a job runs (heavy or light), gray while the queue is idle
-const favicon = (waiting, rendering) => {
+// the tab icon: an old movie camera with two film reels, in color while a job runs (heavy or light), gray while the
+// queue is idle
+const favicon = rendering => {
   const body = rendering ? "#e8e6e1" : "#7d7a74", lens = rendering ? "#3987e5" : "#5a5853";
   const reel = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.2" fill="${body}"/>
     <circle cx="${cx}" cy="${cy}" r="1.4" fill="#1d1c1a"/>
@@ -187,12 +184,11 @@ const favicon = (waiting, rendering) => {
     ${reel(9, 9.5)}${reel(19.5, 9.5)}
     <rect x="4" y="15.5" width="18" height="10.5" rx="2" fill="${body}"/>
     <path d="M22 19.2 28.5 16v9.5L22 22.3z" fill="${lens}"/>
-    <rect x="6.5" y="27" width="3" height="2" fill="${body}"/><rect x="16" y="27" width="3" height="2" fill="${body}"/>
-    ${waiting ? '<circle cx="26.5" cy="5.5" r="4.5" fill="#fab219" stroke="#1d1c1a" stroke-width="1.5"/>' : ""}</svg>`;
+    <rect x="6.5" y="27" width="3" height="2" fill="${body}"/><rect x="16" y="27" width="3" height="2" fill="${body}"/></svg>`;
   const href = "data:image/svg+xml," + encodeURIComponent(svg);
   if ($("favicon").getAttribute("href") !== href) $("favicon").setAttribute("href", href);
 };
-favicon(false, false);
+favicon(false);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const t = ts => ts ? new Date(ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false}) : "?";
 const day = ts => {
@@ -249,36 +245,11 @@ const programLogo = j => { const k = programKind(program(j)); return k ? `<span 
 const programTool = j => toolLogos(j) || programLogo(j) || `<span class="sub">${esc(program(j))}</span>`;
 const programText = j => { const p = program(j); return p && !toolLogos(j) && !programKind(p) ? `<div class="id">${esc(p)}</div>` : ""; };
 const jobLogos = j => toolLogos(j) || programLogo(j);
-// a color per project: the sessions the dispatcher watches in name order, else the projects using cores; a project
-// keeps its color while the page is open
+// a color per project: the video projects (state/sessions.json) in name order, else the projects using cores; a
+// project keeps its color while the page is open
 const SLOTS = [];
 const color = p => SLOTS.includes(p) ? `var(--s${SLOTS.indexOf(p) % 8 + 1})` : "var(--s0)";  // others and unknown: gray
 const cores = n => n >= 10 ? n.toFixed(0) : n.toFixed(1);
-
-// sessions waiting for the user: read by the dispatcher from each session's transcript, longest waiting first
-const WAIT_LABEL = {waiting: "waiting for you", question: "asked you a question", permission: "may need your permission"};
-// a session that needs you to do something: a question, a permission prompt, or (its turn ended) results that ended
-// after its turn did, so it can't know them; a session that is only done with its turn doesn't, nor one whose
-// unseen results ended while it still worked (it may have checked them another way)
-const afterTurn = x => (x.notes || []).filter(n => n.after_turn);
-const needsYou = x => x.state === "question" || x.state === "permission" || (x.state === "waiting" && afterTurn(x).length > 0);
-function showWaiting(sessions) {
-  if (!sessions || !sessions.length) { $("waiting").innerHTML = ""; return; }  // no session watched (state/sessions.json)
-  const now = Date.now() / 1000;
-  const waiting = sessions.filter(needsYou).sort((a, b) => (a.since || 0) - (b.since || 0));
-  const name = x => x.link ? `<a href="${esc(x.link)}" class="proj">${esc(x.project)}</a>` : `<span class="proj">${esc(x.project)}</span>`;
-  // what the session may not know: its project's jobs that no task watches (they won't wake it), results nobody has seen
-  const noteText = n => n.unwatched ? `${n.name} ${n.what}, ${n.elsewhere ? "no task of this session watches it" : "nobody watches it"}`
-    : `${n.name} ${n.what}${n.what === "failed" && n.exit != null ? " (exit " + n.exit + ")" : ""} at ${t(n.finished)}, nobody has seen the result`;
-  const notes = x => (x.state === "waiting" ? afterTurn(x) : x.notes || []).map(n => `<div class="why">${esc(noteText(n))}</div>`).join("");
-  $("waiting").innerHTML = `<h2>Waiting for you</h2>${waiting.length ? `<table>
-    <tr><th>Session</th><th>State</th><th>Since</th><th class="hide-sm">Background</th></tr>
-    ${waiting.map(x => `<tr><td>${name(x)}</td>
-      <td>${x.state === "waiting" ? WAIT_LABEL[x.state] : `<span class="tag paused">${WAIT_LABEL[x.state]}${x.tool ? " · " + esc(x.tool) : ""}</span>`}${notes(x)}</td>
-      <td class="num">${x.since ? day(x.since) + ` <span class="sub">(${dur(now - x.since)})</span>` : "?"}</td>
-      <td class="hide-sm sub">${x.background ? x.background + " task" + (x.background > 1 ? "s" : "") + " running" : ""}</td></tr>`).join("")}</table>`
-    : `<div class="empty">No session needs you.</div>`}`;
-}
 
 function showGpu(g) {
   if (!g || g.util == null) { $("gpu").innerHTML = `<span class="sub">GPU utilization unavailable</span>`; return; }
@@ -312,42 +283,6 @@ function showCores(u) {
   });
 }
 
-// browser notifications while this page is open: a session starts waiting for you (not when renders end)
-const notifyKey = "rq-notify";
-const notifyOn = () => { try { return localStorage.getItem(notifyKey) === "1"; } catch (e) { return false; } };
-const showNotify = () => {
-  const b = $("notify");
-  if (!("Notification" in window)) { b.hidden = true; return; }
-  b.hidden = false;
-  const perm = Notification.permission;
-  b.disabled = perm === "denied";
-  b.textContent = perm === "denied" ? "Notifications blocked by the browser"
-    : perm === "granted" && notifyOn() ? "Notifying when a session waits for you" : "Notify me when a session waits for me";
-};
-$("notify").addEventListener("click", async () => {
-  if (Notification.permission !== "granted") {
-    if (await Notification.requestPermission() !== "granted") { showNotify(); return; }
-    try { localStorage.setItem(notifyKey, "1"); } catch (e) {}
-  } else {
-    try { localStorage.setItem(notifyKey, notifyOn() ? "0" : "1"); } catch (e) {}
-  }
-  showNotify();
-});
-showNotify();
-let waitSeen = null;  // project -> state and since of each session waiting for you, as this page last saw it
-const notifyWaiting = sessions => {
-  const now = new Map((sessions || []).filter(needsYou)
-    .map(x => [x.project, {x, key: x.state + "@" + x.since}]));
-  const fresh = waitSeen ? [...now.values()].filter(w => waitSeen.get(w.x.project) !== w.key).map(w => w.x) : [];
-  waitSeen = new Map([...now].map(([p, w]) => [p, w.key]));
-  if (!notifyOn() || !("Notification" in window) || Notification.permission !== "granted") return;
-  for (const x of fresh) {
-    const n = new Notification(`${x.project} ${WAIT_LABEL[x.state] || "waiting for you"}`, {tag: "rq-session-" + x.project,
-      body: [x.tool || "", ...(x.state === "waiting" ? afterTurn(x) : []).map(m => m.name + " " + m.what)].filter(Boolean).join(" · ")});
-    n.onclick = () => { window.focus(); if (x.link) location.href = x.link; n.close(); };
-  }
-};
-
 let pageVersion = null;
 async function refresh() {
   let s;
@@ -357,14 +292,12 @@ async function refresh() {
   if (s.page && pageVersion && s.page !== pageVersion && $("lightbox").hidden) return location.reload();
   pageVersion = pageVersion || s.page;
   const d = s.dispatcher;
-  const watched = (d.sessions || []).map(x => x.project);
+  const watched = s.watched || [];
   (watched.length ? watched : Object.keys((d.usage || {}).projects || {})).sort().forEach(p => SLOTS.includes(p) || SLOTS.push(p));
   $("dispatcher").innerHTML = d.alive
     ? `<span class="dot on"></span>dispatcher running · ${esc(d.note || "")}`
     : `<span class="dot off"></span>dispatcher not running`;
-  showWaiting(d.sessions);
-  notifyWaiting(d.sessions);
-  favicon((d.sessions || []).some(needsYou), !!(s.running || (s.light || []).length || (s.still || []).length));
+  favicon(!!(s.running || (s.light || []).length || (s.still || []).length));
   showCores(d.usage);
   showGpu(d.gpu);
   const busy = s.running || s.queued.length;

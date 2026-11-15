@@ -947,7 +947,8 @@ def snapshot():
                      "estimate": hold.get("estimate"),
                      "waits_for": [] if hold["status"] != "queued" else
                      ["%s/%s" % (j["project"], j["name"]) for j in side_running({j["id"]: j for j in jobs})]}
-    return {"now": now, "exclusive": exclusive, "keep": keep_rules(now), "dispatcher": d, "running": public(current), "queued": [public(j) for j in queued],
+    return {"now": now, "exclusive": exclusive, "keep": keep_rules(now), "dispatcher": d,
+            "watched": sorted(read_json(SESSIONS, {}) or {}), "running": public(current), "queued": [public(j) for j in queued],
             "light": [public(j) for j in light], "light_queued": [public(j) for j in light_queued],
             "still": [public(j) for j in still], "still_queued": [public(j) for j in still_queued],
             "finished": [public(j) for j in finished], "unseen": news, "all_done": t if (current or queued) else now,
@@ -1168,55 +1169,9 @@ def gpu_sample():
     return (int(util.group(1)) if util else None), (int(cores.group(1)) if cores else None)
 
 
-# ---------- sessions waiting for the user ----------
+# ---------- the Claude Code sessions running here ----------
 
-SESSIONS = os.path.join(STATE, "sessions.json")  # {project: link to its session or null}, the sessions to watch
-CHATS = os.path.join(os.path.expanduser("~/.claude/projects"), ROOT_DASHED + "-")  # + project: its transcripts
-
-
-def utc_ts(text):
-    import calendar
-    try:
-        return calendar.timegm(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
-    except (TypeError, ValueError):
-        return None
-
-
-def last_turn(path):
-    """The last entry of the latest turn that wasn't started by another session (a peer message) and ended, or the
-    last entry of all if a turn is still under way. Reads only the transcript's tail."""
-    try:
-        with open(path, "rb") as f:
-            f.seek(max(0, os.path.getsize(path) - 1048576))
-            lines = f.read().decode("utf-8", "replace").splitlines()
-    except OSError:
-        return None
-    turns = []  # [starter kind, last user/assistant entry]
-    last = None
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if entry.get("type") not in ("user", "assistant") or entry.get("isSidechain") or entry.get("isCompactSummary"):
-            continue  # (a compaction's summary is no prompt: the session hasn't started a turn)
-        last = entry
-        content = (entry.get("message") or {}).get("content")
-        prompt = entry["type"] == "user" and not (isinstance(content, list) and any(
-            isinstance(c, dict) and c.get("type") == "tool_result" for c in content))
-        if prompt:
-            turns.append([(entry.get("origin") or {}).get("kind") or "human", entry])
-        elif turns:
-            turns[-1][1] = entry
-    if not last:
-        return None
-    ended = lambda e: e["type"] == "assistant" and (e.get("message") or {}).get("stop_reason") == "end_turn"
-    if not ended(last):
-        return last  # a turn is under way: working, a question or a permission prompt
-    for kind, entry in reversed(turns):
-        if kind != "peer" and ended(entry):
-            return entry
-    return last
+SESSIONS = os.path.join(STATE, "sessions.json")  # {project: ...}: the video projects' sessions (their colors too)
 
 
 CLAUDE_DESKTOP = re.compile(r"^/(?:(?! -).)*?/claude\.app/Contents/MacOS/claude(?: |$)")  # its path has spaces
@@ -1264,105 +1219,22 @@ def being_cancelled(job):
     return has_flag(job["id"], "cancel") or bool(job.get("cancel_reason"))
 
 
-def session_states(found=None):
-    """Per session: waiting for the user (turn ended, a question, maybe a permission prompt), waiting for its jobs
-    (its turn ended while one of its tasks watches a job in rq) or working. Read from each session's chat
-    transcript tail and its Claude process, never by asking the session. Each comes with what it may not know:
-    its project's jobs that no task watches and results nobody has seen. found (a dict) gets the session ids that
-    Claude processes run and the projects of those that run without one (see session_gone)."""
-    links = read_json(SESSIONS, {}) or {}
-    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True).stdout
-    procs = []
+def claude_scan():
+    """The Claude Code sessions running here, for "session ended" (see session_gone): the session ids on Claude
+    processes' command lines (ids), and the projects a Claude process without one runs in (fresh)."""
+    out = subprocess.run(["ps", "-Ao", "pid=,command="], capture_output=True, text=True).stdout
+    resumed, unnamed = set(), []  # session ids; session processes without one (a CLI session started fresh)
     for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            procs.append((int(parts[0]), int(parts[1]), parts[2]))
-    children = {}
-    for pid, ppid, command in procs:
-        children.setdefault(ppid, []).append(command)
-    resumed = {}  # transcript id -> the session's claude process
-    unnamed = []  # session processes without an id on their command line (a CLI session started fresh)
-    for pid, ppid, command in procs:
-        is_session, session_id = claude_session(command)
+        parts = line.split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        is_session, session_id = claude_session(parts[1])
         if session_id:
-            resumed[session_id] = pid
+            resumed.add(session_id)
         elif is_session:
-            unnamed.append(pid)
-    fresh = {}  # project -> its session process that has no id
-    for pid, cwd in cwds_of(unnamed).items():
-        project = project_of(cwd)
-        if project:
-            fresh.setdefault(project, pid)
-    now = time.time()
-    if found is not None:
-        found.update(ids=sorted(resumed), fresh=sorted(fresh), at=now)
-    jobs = {}  # a project's jobs in rq: queued or running
-    watched = {}  # project -> the live watchers of its jobs
-    notes = {}  # project -> its jobs that no task watches, and results nobody has seen
-    starts = None
-    for job in sorted(all_jobs(), key=lambda j: j.get("submitted") or 0):
-        project = job.get("project")
-        if job["status"] in ("queued", "granted", "running"):
-            counts = jobs.setdefault(project, {"running": 0, "queued": 0})
-            counts["queued" if job["status"] == "queued" else "running"] += 1
-            if from_earlier_boot(job) or being_cancelled(job):
-                continue
-            starts = proc_starts() if starts is None else starts
-            live = live_watchers(job, starts)
-            if live:
-                watched.setdefault(project, []).extend(live)
-            sid = submitter_sid(job)
-            if not [w for w in live if not sid or watches_for(w, sid)]:  # no task of its session will tell it
-                notes.setdefault(project, []).append({"id": job["id"], "name": job["name"], "what": job_what(job),
-                                                      "unwatched": True, "elsewhere": bool(live)})
-        elif job["status"] in TERMINAL and unseen(job, now):
-            notes.setdefault(project, []).append({"id": job["id"], "name": job["name"], "what": job["status"],
-                                                  "exit": job.get("exit"), "finished": job.get("finished"),
-                                                  "unseen": True})
-    states = []
-    for project in sorted(links):
-        folder = CHATS + dashed(project)
-        try:
-            chats = [os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".jsonl")]
-        except OSError:
-            continue
-        live = [c for c in chats if os.path.basename(c)[:-6] in resumed]
-        if resumed and not live and project not in fresh:
-            continue  # sessions run as processes here, and this one has none: it was archived or closed
-        chat = max(live or chats, key=os.path.getmtime, default=None)
-        if not chat:
-            continue
-        entry = last_turn(chat)
-        if not entry:
-            continue
-        claude = resumed.get(os.path.basename(chat)[:-6]) or (None if live else fresh.get(project))
-        shells = [c for c in children.get(claude, []) if "shell-snapshots" in c or c.startswith("/bin/zsh -c")]
-        msg = entry.get("message") or {}
-        content = msg.get("content") if isinstance(msg.get("content"), list) else []
-        since = utc_ts(entry.get("timestamp") or "")
-        tool = next((c for c in reversed(content) if isinstance(c, dict) and c.get("type") == "tool_use"), None)
-        state = "working"
-        sid = os.path.basename(chat)[:-6]
-        if entry["type"] == "assistant" and msg.get("stop_reason") == "end_turn":
-            # while a task of it watches a job in rq, it waits for that job, not for the user; a job nobody
-            # watches won't wake it, so then it waits for the user (the notes say which jobs)
-            waits = any(watches_for(w, sid) for w in watched.get(project, ()))
-            state = "jobs" if waits else "waiting"
-        elif entry["type"] == "assistant" and tool:
-            if tool.get("name") == "AskUserQuestion":
-                state = "question"
-            elif since and now - since > 30 and not shells:
-                state = "permission"
-        # after_turn: a result that ended after the session's last turn did, so it can't know it; one that ended
-        # while the session still worked, it may have read another way (its outputs, rq status), so that one alone
-        # doesn't make the session wait for the user (kept last, so the 6 shown include these)
-        ns = sorted(({**n, "after_turn": bool(n.get("unseen") and since and (n.get("finished") or 0) > since)}
-                     for n in notes.get(project, [])), key=lambda n: n["after_turn"])
-        states.append({"project": project, "state": state, "since": since, "link": links.get(project),
-                       "background": len(shells) if state == "waiting" else 0,
-                       "tool": tool.get("name") if tool and state == "permission" else None,
-                       "jobs": jobs.get(project), "notes": ns[-6:]})
-    return states
+            unnamed.append(int(parts[0]))
+    fresh = {project_of(cwd) for cwd in cwds_of(unnamed).values()} - {None}
+    return {"ids": sorted(resumed), "fresh": sorted(fresh), "at": time.time()}
 
 
 # ---------- outputs: the pictures and videos a job says it writes (rq run --output) ----------
@@ -2448,12 +2320,10 @@ def cmd_daemon(args):
             state["gpu"] = {"error": repr(e)}
         if time.time() - state.get("usage", {}).get("at", 0) >= 5:
             try:
-                found = {}
-                state["sessions"] = session_states(found)
-                state["claude"] = found  # (for "session ended"; snapshot() keeps it off the page)
+                state["claude"] = claude_scan()  # (for "session ended"; snapshot() keeps it off the page)
+                state.pop("claude_error", None)
             except Exception as e:
-                state["sessions"] = []
-                state["sessions_error"] = repr(e)
+                state["claude_error"] = repr(e)
             try:
                 state["usage"] = core_usage()
             except Exception as e:
