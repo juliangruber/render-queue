@@ -67,8 +67,8 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. Stills
   have no time limit. A still needs `--output` for the pictures it writes (a file, a frame pattern or a folder); rq
   refuses `--no-output` and video files (exit 64): those go through `rq light`.
-- Other light work under 5 minutes (tests, previews, short encodes, analyses) goes through `rq light`, also as a
-  background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
+- Other light work under 5 minutes (tests that render, previews, short encodes, analyses of pictures) goes through
+  `rq light`, also as a background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
   Light jobs run one at a time next to the heavy job (two at a time while no heavy job runs), at a lower CPU
   priority (nice 10), so one may wait for its turn. A light job that runs past 5 minutes while other work is waiting is paused and moved into the
   queue, and continues when it's its turn.
@@ -78,6 +78,13 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   2h, and only for measurements. Past its estimate it runs on as an ordinary heavy job (its output says so), so
   a run that outlasts it may not be clean. Use it only for the measuring runs themselves, not for the renders
   around them.
+- Work that renders nothing and isn't computationally heavy runs off the queue, directly, at low priority
+  (`nice -n 10 COMMAND`), however long it takes: key, status and table checks, git and file comparisons, unit and
+  page tests that render nothing, reading logs and job states, docstring checks, watchers. Everything else stays in
+  rq, however short: any render (Blender, Metal or the CPU film chain), encodes, decoding or measuring pictures or
+  video, GPU work, bakes and simulations, and numeric work that keeps several cores busy. When unsure, use
+  `rq light`. (At nice 10 it never holds up the queue; at normal priority, work in a project folder that uses more
+  than about one core does.)
 - Never run renders, Blender, ffmpeg or other heavy work outside rq: it holds up the whole queue.
 - Tell the user the job id when you queue a job. `rq status` shows its position and expected times; the status page
   is http://localhost:8642.

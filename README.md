@@ -253,7 +253,9 @@ prompt, it tells the session which of its jobs no task watches and which results
   holds up the queue until it has ended, and the status page names it. A video project is one in
   `state/sessions.json` or one that has queued a job with rq; other projects' work (a benchmark in a code project,
   say) doesn't hold the queue. Heavy low-priority work outside rq is shown but doesn't
-  hold the queue. Once outside work that held the queue ends, the next job starts after 2 minutes without it
+  hold the queue. The render sessions run work that renders nothing and isn't computationally heavy (checks, git,
+  tests that render nothing, watchers) off the queue at `nice -n 10`, however long it takes (the user's rule,
+  2026-11-15). Once outside work that held the queue ends, the next job starts after 2 minutes without it
   (a gap between two steps of a pipeline doesn't let a job in). Right after the dispatcher starts, a job starts at
   once.
 
