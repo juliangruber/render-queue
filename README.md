@@ -215,7 +215,8 @@ prompt, it tells the session which of its jobs no task watches and which results
   job (the two queues don't wait for each other). While no heavy job has the main turn, two light jobs run at once;
   a second one that started then runs on when a heavy job starts. It runs at low priority (`nice -n 10`), streams its output the same
   way and shows on the status page under "Rendering now". It never holds up the main queue.
-- **Stills** (`rq still`) have a third queue of their own, the same way: one still at a time, next to the heavy job
+- **Stills** (`rq still`) have a third queue of their own, the same way. A still job renders exactly one picture
+  (the user's rule, 2026-11-17); several pictures are several jobs, and a job rendering more goes through `rq run`: one still at a time, next to the heavy job
   and the light job, at `nice -n 10`, so a still renders even while the light queue is busy with tests, encodes or
   analyses. Stills borrow the turns of the other queues while those are empty: one more while the main queue has
   nothing running or queued, and the light queue's (one next to a heavy job, two without) while it has none, so up

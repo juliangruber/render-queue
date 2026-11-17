@@ -4001,7 +4001,7 @@ def main():
     for name, text in (("run", "queue a heavy job; its own rq supervisor runs it on its turn; watch its output"),
                        ("light", "queue a light job: one at a time (two while the main queue runs nothing), at low "
                                  "priority, next to the main queue"),
-                       ("still", "queue a still (pictures only, no time limit): the stills queue, one at a time (more while "
+                       ("still", "queue a still (exactly one picture, no time limit): the stills queue, one at a time (more while "
                                  "the main or the light queue is empty), at low priority, next to them")):
         r = sub.add_parser(name, help=text, description=text)
         r.add_argument("--name", required=True)

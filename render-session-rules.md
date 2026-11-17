@@ -60,12 +60,14 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   so later edits don't change a queued job. From a snapshot outside the project folder, pass `--project NAME` (the
   project's folder name), and have the job write its pictures and videos into the project folder or its
   scratchpad, declared by their absolute paths.
-- Stills (rendering one or a few pictures: a still frame, a contact sheet, a look page's stills)
-  go through `rq still`, also as a background task:
+- A still job renders exactly one picture (one frame, one look page still), and goes through `rq still`, also as
+  a background task. Several pictures are several still jobs (queue them with `--detach` and follow them with one
+  `rq wait`); a job that renders more than one picture in one go, or runs checks and tests around its renders (a
+  gate check, a proof run), goes through `rq run` as a heavy job, however short:
   `rq still --name NAME --output stills/shot.png -- COMMAND`
   Stills have their own queue, one at a time next to the heavy job and the light job (more at a time while the
   main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. Stills
-  have no time limit. A still needs `--output` for the pictures it writes (a file, a frame pattern or a folder); rq
+  have no time limit (one frame may take long). A still needs `--output` for the pictures it writes (a file, a frame pattern or a folder); rq
   refuses `--no-output` and video files (exit 64): those go through `rq light`.
 - Other light work under 5 minutes (tests that render, previews, short encodes, analyses of pictures) goes through
   `rq light`, also as a background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
