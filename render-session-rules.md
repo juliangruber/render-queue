@@ -65,11 +65,11 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   For a look page, one still job may render everything the page needs for one new combination of knobs: the
   rendered frame, its 2 charts and, if necessary, the Blender render it starts from. Several pictures (or several
   knob combinations) are several still jobs (queue them with `--detach` and follow them with one `rq wait`); a job
-  that renders more than one picture in one go, or runs checks and tests around its renders (a gate check, a proof
+  that renders more than that in one go, or runs checks and tests around its renders (a gate check, a proof
   run), goes through `rq run` as a heavy job, however short.
   Stills have their own queue, one at a time next to the heavy job and the light job (more at a time while the
   main or the light queue is empty), at nice 10, so a still renders even while the light queue is busy. Stills
-  have no time limit (one frame may take long). A still needs `--output` for the picture it writes (a file, a
+  have no time limit (one frame may take long). A still needs `--output` for the pictures it writes (a file, a
   frame pattern or a folder); rq refuses `--no-output` and video files (exit 64): those go through `rq light`.
 - Other light work under 5 minutes (tests that render, previews, short encodes, analyses of pictures) goes through
   `rq light`, also as a background task: `rq light --name NAME --output previews/shot.mp4 -- COMMAND` (or `--no-output`)
