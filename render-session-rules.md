@@ -60,9 +60,11 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   so later edits don't change a queued job. From a snapshot outside the project folder, pass `--project NAME` (the
   project's folder name), and have the job write its pictures and videos into the project folder or its
   scratchpad, declared by their absolute paths.
-- A still job renders exactly one picture (one frame, one look page still), and goes through `rq still`, also as
-  a background task: `rq still --name NAME --output stills/shot.png -- COMMAND`
-  Several pictures are several still jobs (queue them with `--detach` and follow them with one `rq wait`); a job
+- A still job renders one picture, and goes through `rq still`, also as a background task:
+  `rq still --name NAME --output stills/shot.png -- COMMAND`
+  For a look page, one still job may render everything the page needs for one new combination of knobs: the
+  rendered frame, its 2 charts and, if necessary, the Blender render it starts from. Several pictures (or several
+  knob combinations) are several still jobs (queue them with `--detach` and follow them with one `rq wait`); a job
   that renders more than one picture in one go, or runs checks and tests around its renders (a gate check, a proof
   run), goes through `rq run` as a heavy job, however short.
   Stills have their own queue, one at a time next to the heavy job and the light job (more at a time while the
