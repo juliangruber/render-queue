@@ -94,7 +94,9 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   is http://localhost:8642.
 - Don't wait for other sessions, read their transcripts or check their processes: the queue does that.
 - Don't reorder the queue yourself. If the user says "go" for a job, ask the queue session to move it first (or tell
-  the user to). Only the user decides whether a light job may run longer than 5 minutes.
+  the user to). You may also always ask the queue session to move your own jobs, without a "go" (the user's rule,
+  2026-11-18): say which jobs go where (first, or right before or after which job) and why. Never ask about other
+  sessions' jobs. Only the user decides whether a light job may run longer than 5 minutes.
 - Pause or stop only your own processes, by exact PID, and leave no processes behind when a job is done. rq's
   processes (`rq _supervise ID` and the job under it) belong to rq even after your session restarts. Never kill
   them; use `rq cancel ID`.

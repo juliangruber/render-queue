@@ -27,6 +27,8 @@ whose turn it is and serves the status page.
                             (rq resume of a light job or still the cap moved into the queue, when the user
                             says let it run: it continues now, past the cap)
   rq move ID first          (when the user says go: put a queued job next in line)
+  rq move ID before OTHER | rq move ID after OTHER   (put a queued job right before or after another queued
+                            job in the same queue; every other job keeps its place)
   rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
   rq keep ID                (when the user says so: a light job may run longer than 5 min)
@@ -3713,9 +3715,23 @@ def cmd_move(args):
         return
     if job["status"] != "queued":
         sys.exit("rq: %s isn't queued" % job["id"])
-    first = [i for i in (read_json(ORDER, []) or []) if i != job["id"]]
-    write_json(ORDER, [job["id"]] + first)
-    print("rq: %s is next in line" % job["id"])
+    old = read_json(ORDER, []) or []
+    if args.where == "first":
+        write_json(ORDER, [job["id"]] + [i for i in old if i != job["id"]])
+        print("rq: %s is next in line" % job["id"])
+        return
+    if not args.other:  # before OTHER, after OTHER: a place in its own queue, next to another queued job there
+        sys.exit("rq: rq move ID %s needs OTHER, the queued job to put it next to" % args.where)
+    other = find_job(args.other)
+    lane = lambda j: j.get("kind") if side(j) else "main"
+    if other["id"] == job["id"] or other["status"] != "queued" or lane(other) != lane(job):
+        sys.exit("rq: %s isn't another queued job in the same queue as %s" % (other["id"], job["id"]))
+    line = [j["id"] for j in queue_order([j for j in all_jobs() if j["status"] == "queued" and lane(j) == lane(job)])
+            if j["id"] != job["id"]]
+    at = line.index(other["id"]) + (args.where == "after")
+    line[at:at] = [job["id"]]
+    write_json(ORDER, line + [i for i in old if i not in line])  # the whole queue's order, so nothing else moves
+    print("rq: %s is now %s %s, number %d in line" % (job["id"], args.where, other["id"], at + 1))
 
 
 def cmd_log(args):
@@ -4052,7 +4068,8 @@ def main():
     k.add_argument("--off", action="store_true")
     m = sub.add_parser("move")
     m.add_argument("id")
-    m.add_argument("where", choices=["first", "queue"])
+    m.add_argument("where", choices=["first", "queue", "before", "after"])
+    m.add_argument("other", nargs="?")
     e = sub.add_parser("estimate")
     e.add_argument("id")
     e.add_argument("duration")

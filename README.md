@@ -46,7 +46,8 @@ A Claude Code session in the `render-queue` folder. It runs no renders itself.
 
    > You are the queue session for rq, the render queue in this folder. Read README.md. You run no renders yourself.
    > Start the dispatcher, keep it running, and change the queue (rq move, cancel, pause, resume, keep, estimate)
-   > only when I ask, or when a render session passes on my "go" for one of its jobs.
+   > only when I ask, when a render session passes on my "go" for one of its jobs, or when a render session asks
+   > to move its own jobs.
 
 2. It starts the dispatcher: `./rq start`. The dispatcher runs detached, so it outlives the session that started it,
    and only one can run at a time. After a restart of the Mac, start it again.
@@ -69,6 +70,7 @@ From then on you tell the queue session what to change, and it runs:
 | You say | It runs |
 | --- | --- |
 | "go" for a queued job | `rq move ID first` (it runs next) |
+| a session asks to move its own jobs (allowed at any time, the user's rule since 2026-11-18) | `rq move ID first`, `rq move ID before OTHER` or `rq move ID after OTHER` (every other job keeps its place) |
 | a running light job may run longer than 5 minutes | `rq keep ID` (before the 5 minutes are up) |
 | let a light job or still the cap paused and moved into the queue run now | `rq resume ID` (it continues at once, past the cap) |
 | the light jobs and stills of a step tonight may run longer | `rq keep --match 'gewalt/*-inst-cgrun*' --until 09:00` |
@@ -276,6 +278,8 @@ rq cancel ID
 rq pause ID / rq resume ID   (stop or continue the job's processes; it keeps its turn. rq resume of a light job or
                              still the cap moved into the queue continues it now, past the cap)
 rq move ID first             (when the user says go: this queued job runs next)
+rq move ID before OTHER      (this queued job goes right before another queued job in its queue; after OTHER
+                             right after it; every other job keeps its place)
 rq move ID queue             (pause a running light job or still, move it to the end of the main queue)
 rq keep ID                   (when the user says so: this light job may run longer than 5 minutes)
 rq keep --match 'P/NAME*' --until 09:00   (the same for the matching jobs until then; --for 10h, --off)
