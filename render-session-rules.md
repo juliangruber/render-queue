@@ -97,7 +97,10 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   the user to). You may also always ask the queue session to move your own jobs, without a "go" (the user's rule,
   2026-11-18): say which jobs go where (first, or right before or after which job) and why. Never ask about other
   sessions' jobs. The queue session can also hold one of your queued jobs in its place, for example until there is
-  enough free disk space for it (`rq hold ID --free 30G`); ask it to. Only the user decides whether a light job may
+  enough free disk space for it (`rq hold ID --free 30G`); ask it to.
+- A job that needs a lot of disk space (a film check, a long frame sequence) can wait for it from the start: with
+  `--free 25G` on `rq run`, `rq light` or `rq still` it keeps its place in the queue but starts only once 25 GB are
+  free (jobs behind it may go first meanwhile). `rq status` shows it as "HELD until 25 GB are free". Only the user decides whether a light job may
   run longer than 5 minutes.
 - Pause or stop only your own processes, by exact PID, and leave no processes behind when a job is done. rq's
   processes (`rq _supervise ID` and the job under it) belong to rq even after your session restarts. Never kill

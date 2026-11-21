@@ -270,6 +270,17 @@ def hold_of(job_id):
         return None
 
 
+def parse_size(text):
+    """30G, 30GB, 500M: bytes (decimal, as df -H and Finder count), or None."""
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([GM])B?$", (text or "").strip(), re.I)
+    return int(float(m.group(1)) * (1e9 if m.group(2).upper() == "G" else 1e6)) if m else None
+
+
+def set_hold(job_id, need):
+    with open(flag(job_id, "hold"), "w") as f:
+        f.write(str(need))
+
+
 def on_hold(job):
     """A queued job rq hold keeps from starting: it keeps its place, and the jobs behind it may go first."""
     need = hold_of(job["id"])
@@ -2619,6 +2630,10 @@ def cmd_run(args):
         print("rq: %s. Nothing was queued." % PROJECT_HELP, file=sys.stderr)
         return EXIT_USAGE
     cwd = os.getcwd()
+    free = parse_size(args.free) if args.free else None
+    if args.free and not free:
+        print("rq: --free takes a size like 25G or 500M. Nothing was queued.", file=sys.stderr)
+        return EXIT_USAGE
     try:  # before anything is written: this refusal is how a session learns to say where its job writes
         outputs = declare_outputs(args.outputs or [], args.no_output, cwd, project)
         if args.cmd == "still":
@@ -2710,6 +2725,8 @@ def cmd_run(args):
     except Exception:
         job["tools"] = []
     open(log_path, "w").close()
+    if free:  # the hold before the record: the dispatcher never sees this job without it
+        set_hold(job_id, free)
     save_job(job)
     pid = detach([sys.executable, RQ_PATH, "_supervise", job_id, "--lock-fd", str(lock)], log_path, keep_fd=lock)
     os.close(lock)
@@ -3689,14 +3706,10 @@ def cmd_hold(args):
         return
     if job["status"] != "queued":
         sys.exit("rq: %s isn't queued" % job["id"])
-    need = 0
-    if args.free:
-        m = re.match(r"^(\d+(?:\.\d+)?)\s*([GM])B?$", args.free.strip(), re.I)
-        if not m:
-            sys.exit("rq: --free takes a size like 30G or 500M")
-        need = int(float(m.group(1)) * (1e9 if m.group(2).upper() == "G" else 1e6))
-    with open(flag(job["id"], "hold"), "w") as f:
-        f.write(str(need))
+    need = parse_size(args.free) if args.free else 0
+    if need is None:
+        sys.exit("rq: --free takes a size like 30G or 500M")
+    set_hold(job["id"], need)
     print("rq: %s is held in its place%s" % (job["id"], " until %s are free" % args.free if need else
                                               "; rq hold %s --off lets it start" % job["id"]))
 
@@ -4107,6 +4120,9 @@ def main():
                             "%%04d, %%d, with the job's zero padding) the job writes, in the project; repeat it for "
                             "several. Every job needs --output or --no-output")
         r.add_argument("--no-output", action="store_true", help="the job writes no pictures or videos")
+        r.add_argument("--free", metavar="SIZE", help="e.g. 25G: the job keeps its place in the queue but doesn't "
+                                                      "start until that much disk space is free (jobs behind it "
+                                                      "may go first)")
         again = r.add_mutually_exclusive_group()
         again.add_argument("--again", action="store_true",
                            help="queue it even if the same job is still queued or running and no task watches it")
