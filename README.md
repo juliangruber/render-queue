@@ -75,6 +75,7 @@ From then on you tell the queue session what to change, and it runs:
 | let a light job or still the cap paused and moved into the queue run now | `rq resume ID` (it continues at once, past the cap) |
 | the light jobs and stills of a step tonight may run longer | `rq keep --match 'gewalt/*-inst-cgrun*' --until 09:00` |
 | a job will take longer or shorter | `rq estimate ID 2h` |
+| a queued job mustn't start yet (e.g. into a full disk) | `rq hold ID --free 30G` (it keeps its place and starts once 30 GB are free; the jobs behind it go first), or `rq hold ID` until `rq hold ID --off` |
 | stop a job | `rq cancel ID` |
 | hold a running job, keeping its turn | `rq pause ID`, later `rq resume ID` |
 | a running light job or still should wait its turn | `rq move ID queue` |
@@ -284,6 +285,8 @@ rq move ID queue             (pause a running light job or still, move it to the
 rq keep ID                   (when the user says so: this light job may run longer than 5 minutes)
 rq keep --match 'P/NAME*' --until 09:00   (the same for the matching jobs until then; --for 10h, --off)
 rq estimate ID 90m           (set or correct a job's expected duration)
+rq hold ID [--free 30G]      (a queued job keeps its place but doesn't start: until rq hold ID --off, or until
+                             that much disk space is free; the jobs behind it go first)
 rq start [--port 8642]       (start the dispatcher and the status page detached, one per machine)
 rq daemon [--port 8642]      (the same in the foreground)
 ```

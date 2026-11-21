@@ -31,6 +31,8 @@ whose turn it is and serves the status page.
                             job in the same queue; every other job keeps its place)
   rq move ID queue          (pause a running light job or still and move it to the end of the main queue)
   rq estimate ID 90m        (set or correct a job's expected duration)
+  rq hold ID [--free 30G]   (a queued job keeps its place but doesn't start, until rq hold ID --off or, with
+                            --free, until that much disk space is free; the jobs behind it go first)
   rq keep ID                (when the user says so: a light job may run longer than 5 min)
   rq keep --match 'PROJECT/NAME*' --until 08:00 | --for 10h   (the same for the matching jobs until then;
                             rq keep lists the rules, --off ends one)
@@ -258,9 +260,32 @@ def set_flag(job_id, kind, on=True):
             pass
 
 
+def hold_of(job_id):
+    """rq hold: None if the job isn't held, else the free disk space (bytes) it waits for, 0 for none (held until
+    rq hold ID --off)."""
+    try:
+        with open(flag(job_id, "hold")) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return None
+
+
+def on_hold(job):
+    """A queued job rq hold keeps from starting: it keeps its place, and the jobs behind it may go first."""
+    need = hold_of(job["id"])
+    if need is None:
+        return False
+    if not need:
+        return True
+    try:
+        return shutil.disk_usage(STATE).free < need
+    except OSError:
+        return True
+
+
 def clear_flags(job_id):
     """A job that ended needs none of its flags."""
-    for kind in ("cancel", "paused", "keep"):
+    for kind in ("cancel", "paused", "keep", "hold"):
         try:
             set_flag(job_id, kind, False)
         except OSError:
@@ -920,6 +945,8 @@ def snapshot():
     light, light_queued, still, still_queued = lane["light"], lane_queued["light"], lane["still"], lane_queued["still"]
     for job in light + still:
         job["elapsed"] = now - (job.get("started") or job["submitted"])
+    for job in light_queued + still_queued:
+        job["held"] = hold_of(job["id"]) if on_hold(job) else None
     d = dispatcher_state()
     # while the queue waits for renders outside it, nobody knows when they end, so start times are unknown
     t = None if (not current and d.get("alive") and any(not w.get("low") for w in d.get("warnings", []))) else now
@@ -936,6 +963,10 @@ def snapshot():
     for job in queued:
         exp = expected_duration(job, history)
         job["expected"] = exp
+        job["held"] = hold_of(job["id"]) if on_hold(job) else None
+        if job["held"] is not None:  # the jobs behind it go first: no times for it
+            job["eta_start"] = job["eta"] = None
+            continue
         job["eta_start"] = t
         t = t + exp if (t and exp) else None
         job["eta"] = t
@@ -1928,7 +1959,8 @@ def exclusive_hold(jobs):
     if main and main["status"] not in TERMINAL:
         left = exclusive_left(main)
         return main if main.get("exclusive") and (left is None or left > 0) else None
-    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)])
+    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)
+                          and not on_hold(j)])
     return queued[0] if queued and queued[0].get("exclusive") else None
 
 
@@ -2019,7 +2051,7 @@ def dispatch_side(jobs, kind, hold=False):
     if len(busy) >= room:
         return
     waiting = queue_order([j for j in jobs.values() if j.get("kind") == kind and j["status"] == "queued"
-                           and waits(j)])
+                           and waits(j) and not on_hold(j)])
     for job in waiting[:room - len(busy)]:
         path = next((p for p in paths if not granted(p)), None)
         if not path or (path != paths[0] and (job.get("any_slot") or 0) < SLOT_NEEDS[kind]):
@@ -2246,7 +2278,8 @@ def dispatch_main(state, jobs):
         state["warnings"] = strays(ours, video)
         state["note"] = note or "running %s" % grant
         return
-    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)])
+    queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)
+                          and not on_hold(j)])
     state["warnings"] = strays(ours, video)
     stopping = sorted(i for i in _cancels_sent if (jobs.get(i) or {}).get("status") == "queued")
     if queued and stopping:  # a frozen job nobody owns runs again until its processes end: not next to the next job
@@ -3648,6 +3681,26 @@ def cmd_estimate(args):
     print("rq: %s is expected to take %s" % (job["id"], fmt_duration(seconds)))
 
 
+def cmd_hold(args):
+    job = find_job(args.id)
+    if args.off:
+        set_flag(job["id"], "hold", False)
+        print("rq: %s isn't held any more" % job["id"])
+        return
+    if job["status"] != "queued":
+        sys.exit("rq: %s isn't queued" % job["id"])
+    need = 0
+    if args.free:
+        m = re.match(r"^(\d+(?:\.\d+)?)\s*([GM])B?$", args.free.strip(), re.I)
+        if not m:
+            sys.exit("rq: --free takes a size like 30G or 500M")
+        need = int(float(m.group(1)) * (1e9 if m.group(2).upper() == "G" else 1e6))
+    with open(flag(job["id"], "hold"), "w") as f:
+        f.write(str(need))
+    print("rq: %s is held in its place%s" % (job["id"], " until %s are free" % args.free if need else
+                                              "; rq hold %s --off lets it start" % job["id"]))
+
+
 def cmd_keep(args):
     if args.match or not args.id:
         return keep_rule(args)
@@ -3779,6 +3832,8 @@ def cmd_status(args):
         print("disk: only %.1f GB free: jobs that write pictures may fail" % (d["disk"] / 1e9))
     def seen(j):  # who sees a job: nobody watches it, its session ended, its owner is gone, nobody saw its result
         marks = ["exclusive"] if j.get("exclusive") and not j.get("exclusive_over") else []
+        if j.get("held") is not None:
+            marks.append("HELD" + (" until %.0f GB are free" % (j["held"] / 1e9) if j["held"] else ""))
         if j.get("owner_alive") is False:
             marks.append("its rq supervisor is gone")
         if j.get("unwatched"):
@@ -4081,6 +4136,10 @@ def main():
     s.add_argument("--json", action="store_true")
     for name in ("cancel", "pause", "resume"):
         sub.add_parser(name).add_argument("id")
+    h = sub.add_parser("hold")
+    h.add_argument("id")
+    h.add_argument("--free")
+    h.add_argument("--off", action="store_true")
     k = sub.add_parser("keep")
     k.add_argument("id", nargs="?")
     k.add_argument("--match")
@@ -4111,7 +4170,7 @@ def main():
     if args.cmd in ("wait", "mine", "_supervise"):
         sys.exit({"wait": cmd_wait, "mine": cmd_mine, "_supervise": cmd_supervise}[args.cmd](args))
     {"status": cmd_status, "cancel": cmd_cancel, "pause": cmd_pause,
-     "resume": lambda a: cmd_pause(a, False), "move": cmd_move, "keep": cmd_keep, "estimate": cmd_estimate, "log": cmd_log, "daemon": cmd_daemon,
+     "resume": lambda a: cmd_pause(a, False), "move": cmd_move, "keep": cmd_keep, "hold": cmd_hold, "estimate": cmd_estimate, "log": cmd_log, "daemon": cmd_daemon,
      "start": cmd_start}[args.cmd](args)
 
 
