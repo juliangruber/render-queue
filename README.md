@@ -50,7 +50,7 @@ A Claude Code session in the `render-queue` folder. It runs no renders itself.
    > to move its own jobs.
 
 2. It starts the dispatcher: `./rq start`. The dispatcher runs detached, so it outlives the session that started it,
-   and only one can run at a time. After a restart of the Mac, start it again.
+   and only one can run at a time. After a restart of the Mac, start it again. A full disk doesn't stop it (it writes its state again on the next tick), and `rq status` warns when less than 20 GB is free.
 3. Open the status page: http://localhost:8642 (local only; `rq start --port N` for another port).
 4. Optional: have it write `state/sessions.json`, the video projects, every project folder name (the values aren't
    used):

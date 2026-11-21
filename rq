@@ -116,6 +116,7 @@ ROOT = os.path.realpath(os.environ.get("RQ_ROOT") or os.path.dirname(HOME))  # t
 ROOT_DASHED = re.sub(r"[^A-Za-z0-9]", "-", ROOT)  # as Claude Code names scratchpad and transcript folders
 SELF = os.path.basename(HOME)  # the queue's own folder, never a project
 PORT = 8642
+DISK_LOW = 20e9  # rq status warns below this much free space on the state disk
 TICK = 2
 QUIET_NICE = 10  # processes at this niceness or more don't block the queue (stills, previews, tests)
 GROUP_HEAVY_CPU = 80  # a project's process group using this much CPU (%) outside the queue blocks it
@@ -149,9 +150,16 @@ def read_json(path, default=None):
 
 def write_json(path, data):
     tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=1)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    except BaseException:  # (a full disk): no half written file left behind; the old one stays
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def job_path(job_id):
@@ -2330,8 +2338,19 @@ def cmd_daemon(args):
                 state["usage"] = core_usage()
             except Exception as e:
                 state["usage"] = {"at": time.time(), "error": repr(e)}
+            try:
+                state["disk"] = shutil.disk_usage(STATE).free
+            except OSError:
+                state.pop("disk", None)
         state["beat"] = time.time()
-        write_json(DISPATCHER, state)
+        try:
+            write_json(DISPATCHER, state)
+        except OSError as e:  # a full disk must not stop the queue: it tries again next tick
+            if not state.get("write_error"):
+                print("rq: writing %s: %r" % (DISPATCHER, e), flush=True)
+            state["write_error"] = repr(e)
+        else:
+            state.pop("write_error", None)
         time.sleep(TICK)
 
 
@@ -3756,6 +3775,8 @@ def cmd_status(args):
     g = d.get("gpu") or {}
     if g.get("util") is not None:
         print("gpu: %d%% of %s GPU cores (average over 10 s)" % (g["util"], g.get("cores") or "?"))
+    if d.get("disk") is not None and d["disk"] < DISK_LOW:
+        print("disk: only %.1f GB free: jobs that write pictures may fail" % (d["disk"] / 1e9))
     def seen(j):  # who sees a job: nobody watches it, its session ended, its owner is gone, nobody saw its result
         marks = ["exclusive"] if j.get("exclusive") and not j.get("exclusive_over") else []
         if j.get("owner_alive") is False:
