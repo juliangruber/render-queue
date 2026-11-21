@@ -39,7 +39,8 @@ the CLAUDE.md that imports this file names both. When the queue session says the
 - The background task only watches the job: live output and the job's exit code. Stopping it (TaskStop, the stop
   button, a timeout), a subagent ending, a session restart, an app restart or an account switch do not stop the
   job. To cancel a job on purpose: `rq cancel ID`. To replace one: `rq run --replace ...` (it cancels this
-  project's jobs with the same name first), or `rq cancel ID` and then submit.
+  project's jobs with the same name first, and takes a queued one's place in the queue), or `rq cancel ID` and then
+  submit (that goes to the end of the queue).
 - If you wait for a job but have no rq task running for it (after a restart or account switch, or for a job a
   subagent queued), run `rq mine --unwatched` and start `rq wait ID` as a background task for the jobs it lists.
   It shows the output from there and exits with the job's exit code; for a finished job it reports the result at

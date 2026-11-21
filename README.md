@@ -205,7 +205,7 @@ prompt, it tells the session which of its jobs no task watches and which results
   session "unseen".
 - `--detach` submits without watching. An identical job (same project, name, folder and command) that is still
   queued or running and that no task of its session watches isn't submitted again: `--again` queues another copy
-  anyway, `--replace` first cancels this project's jobs with that name. If only its outputs differ (a session
+  anyway, `--replace` first cancels this project's jobs with that name (and the new job takes a queued one's place in the queue). If only its outputs differ (a session
   correcting its `--output`s), the job, queued or running, takes the new ones when the same session resubmits it
   (another session's job keeps its own, and the message says they differ). A job with the same name from another
   folder (a new snapshot) or with another command isn't refused, but `rq run` names it, since it was not cancelled.

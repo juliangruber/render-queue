@@ -2678,7 +2678,13 @@ def cmd_run(args):
     named = live_jobs_named(project, args.name)
     same = [j for j in named if j.get("cwd") == cwd and j.get("command") == text]  # an identical job
     others = []  # the same name, from another folder or with another command, and no task of its session watches it
+    place = None  # (the queue's order, the queued job it replaces): this job takes that job's place in it
     if named and args.replace:  # the same name: also a changed command, or one run from a new snapshot
+        lane = lambda j: j.get("kind") if side(j) else "heavy"
+        old = next((j for j in named if j["status"] == "queued" and lane(j) == (args.cmd if light else "heavy")), None)
+        if old:
+            place = ([j["id"] for j in queue_order([j for j in all_jobs() if j["status"] == "queued"
+                                                    and lane(j) == lane(old)])], old["id"])
         for j in named:
             err = cancel_job(j, "rq run --replace")
             say("cancelling %s, which this job replaces%s" % (
@@ -2727,6 +2733,10 @@ def cmd_run(args):
     open(log_path, "w").close()
     if free:  # the hold before the record: the dispatcher never sees this job without it
         set_hold(job_id, free)
+    if place:  # the order before the record, so the dispatcher never sees it at the end of the queue
+        line, old_id = place
+        write_json(ORDER, [job_id if i == old_id else i for i in line]
+                   + [i for i in (read_json(ORDER, []) or []) if i not in line])
     save_job(job)
     pid = detach([sys.executable, RQ_PATH, "_supervise", job_id, "--lock-fd", str(lock)], log_path, keep_fd=lock)
     os.close(lock)
@@ -4127,7 +4137,8 @@ def main():
         again.add_argument("--again", action="store_true",
                            help="queue it even if the same job is still queued or running and no task watches it")
         again.add_argument("--replace", action="store_true",
-                           help="first cancel this project's jobs with this name that are still queued or running")
+                           help="first cancel this project's jobs with this name that are still queued or running; "
+                                "a queued one's place in the queue goes to this job")
         if name == "run":
             r.add_argument("--exclusive", action="store_true",
                            help="run alone on the machine, for measurements (timing, GPU load): it starts once no "
