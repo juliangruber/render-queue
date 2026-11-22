@@ -223,8 +223,8 @@ prompt, it tells the session which of its jobs no task watches and which results
   user's rule, 2026-11-17); several pictures are several jobs, and a job rendering more goes through `rq run`: one still at a time, next to the heavy job
   and the light job, at `nice -n 10`, so a still renders even while the light queue is busy with tests, encodes or
   analyses. Stills borrow the turns of the other queues while those are empty: one more while the main queue has
-  nothing running or queued, and the light queue's (one next to a heavy job, two without) while it has none, so up
-  to four stills at a time on an otherwise idle machine. A still that started on a borrowed turn runs on when work
+  nothing running or queued, and the light queue's (one next to a heavy job, two without) while it has none, but
+  never more than three stills at a time (the user's rule, 2026-11-22). A still that started on a borrowed turn runs on when work
   comes to that queue. A still writes pictures (a picture, a frame pattern or a folder of pictures): it needs `--output`, and
   rq refuses `--no-output` and a video file (exit 64). Stills have no time limit: the 5 minute cap below is for light
   work only.
@@ -265,7 +265,7 @@ rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90
 rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace] -- COMMAND...
                              (light work: the light queue, one at a time (two while no heavy job runs), at nice 10)
 rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace] -- COMMAND...
-                             (stills: the stills queue, one at a time (up to four while the other queues are
+                             (stills: the stills queue, one at a time (up to three while the other queues are
                              empty), at nice 10, pictures only)
                              (--output PATH, -o PATH: a file, a folder/ or a frame pattern like 'renders/####.png'
                              the job writes, repeated for several; --no-output: it writes no pictures or videos;

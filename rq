@@ -110,6 +110,7 @@ side = lambda j: j.get("kind") in SIDE  # a light job or a still, not (or no lon
 SLOTS = {"light": [GRANT_LIGHT, GRANT_LIGHT_2], "still": [GRANT_STILL] + GRANTS_STILL_MORE}
 # any_slot a supervisor must have written for a turn past a queue's first: 2 knows the stills' further turns
 SLOT_NEEDS = {"light": 1, "still": 2}
+STILLS_MAX = 3  # stills at a time, borrowed turns included (the user's rule, 2026-11-22)
 turn_paths = lambda kind: SLOTS.get(kind, [GRANT])
 ORDER = os.path.join(STATE, "order.json")
 KEEP_RULES = os.path.join(STATE, "keep.json")  # rq keep --match: [{match, until, added}]
@@ -2035,7 +2036,7 @@ def apply_keep(jobs):
 def dispatch_side(jobs, kind, hold=False):
     """A side queue (light jobs, or stills): one job of its kind at a time, in queue order; the light queue two
     while no job has the main turn; stills one more while the main queue is empty (nothing running or queued) and
-    the light queue's turns (one, or two) while that is empty. A job that started on such a turn runs on when work
+    the light queue's turns (one, or two) while that is empty, at most STILLS_MAX stills. A job that started on such a turn runs on when work
     comes to the queue it borrowed from. A running one (also a light job started before this queue existed) holds
     a slot; one that ran over the cap and moved into the main queue frees it. A further turn goes only to a job
     whose supervisor looks for it (any_slot, SLOT_NEEDS: an older one looks only at the first)."""
@@ -2059,6 +2060,7 @@ def dispatch_side(jobs, kind, hold=False):
         empty = lambda of: not any(of(j) and j["status"] in ("queued", "granted", "running") for j in jobs.values())
         room = 1 + (not main and empty(lambda j: not side(j))) \
             + ((1 if main else len(SLOTS["light"])) if empty(lambda j: j.get("kind") == "light") else 0)
+        room = min(room, STILLS_MAX)
     if len(busy) >= room:
         return
     waiting = queue_order([j for j in jobs.values() if j.get("kind") == kind and j["status"] == "queued"
