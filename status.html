@@ -307,8 +307,10 @@ async function refresh() {
   const light = (s.light || []).concat(s.still || []);
   // rq run --exclusive: alone on the machine while its estimate lasts; the light and stills queues hold for it
   const x = s.exclusive;
-  const exTag = j => j.exclusive && !j.exclusive_over ? ` <span class="tag" title="rq run --exclusive: a measurement that runs alone on the machine; no light job or still starts beside it while its estimate lasts">exclusive</span>` : "";
-  const held = x ? (x.running ? `${x.project}/${x.name} runs alone on the machine until ~${day(x.until)}`
+  const exTag = j => !j.exclusive || j.exclusive_over ? "" : j.full_render
+    ? ` <span class="tag" title="rq run --full-render: a full render that runs alone on the machine; no light job or still starts beside it until it ends">full render</span>`
+    : ` <span class="tag" title="rq run --exclusive: a measurement that runs alone on the machine; no light job or still starts beside it while its estimate lasts">exclusive</span>`;
+  const held = x ? (x.running ? `${x.project}/${x.name} runs alone on the machine ${x.full ? "until it ends" : `until ~${day(x.until)}`}`
     : `${x.project}/${x.name} runs alone on the machine next${x.waits_for.length ? `, once ${x.waits_for.join(", ")} ended` : ""}`) : "";
   const heldNote = x ? `<div class="sub" style="margin:8px 0 0">No light job or still starts: ${esc(held)}.</div>` : "";
   const heavyCard = r => {

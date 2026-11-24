@@ -84,6 +84,10 @@ the CLAUDE.md that imports this file names both. When the queue session says the
   2h, and only for measurements. Past its estimate it runs on as an ordinary heavy job (its output says so), so
   a run that outlasts it may not be clean. Use it only for the measuring runs themselves, not for the renders
   around them.
+- A full render (a whole film or cut, not a section, a shot or a test) goes through
+  `rq run --full-render --name NAME --estimate 40h ... -- COMMAND` (the user's rule, 2026-11-24, after the Mac hung
+  with a full render and two stills running). It runs alone on the machine like an exclusive job, but for its whole
+  run: no light job or still starts beside it until it ends, and its estimate has no limit.
 - Work that renders nothing and isn't computationally heavy runs off the queue, directly, at low priority
   (`nice -n 10 COMMAND`), however long it takes: key, status and table checks, git and file comparisons, unit and
   page tests that render nothing, reading logs and job states, docstring checks, watchers. Everything else stays in

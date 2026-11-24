@@ -236,6 +236,10 @@ prompt, it tells the session which of its jobs no task watches and which results
   it runs, the light and stills queues hold, for as long as its `--estimate`: then its log says so and it runs on
   as an ordinary heavy job, with light jobs and stills beside it. It needs `--estimate`, at most 2 hours (exit 64
   otherwise). The status page tags it "exclusive" and says until when the queues hold.
+- **Full renders** (`rq run --full-render`): a full render (a whole film or cut) is an exclusive job for its whole
+  run (the user's rule, 2026-11-24, after the Mac hung with a full render and two stills running). It waits and
+  starts like an exclusive job, but its `--estimate` has no limit, and the light and stills queues hold until it
+  ends, also past its estimate. The status page tags it "full render".
 - Light work is capped at 5 minutes while other work is active (a heavy job running or queued, or a light job
   waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
   and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status
@@ -262,7 +266,7 @@ prompt, it tells the session which of its jobs no task watches and which results
 
 ```
 rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90m] [--detach]
-       [--again | --replace] -- COMMAND...
+       [--again | --replace] [--exclusive | --full-render] -- COMMAND...
 rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace] -- COMMAND...
                              (light work: the light queue, one at a time (two while no heavy job runs), at nice 10)
 rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace] -- COMMAND...
