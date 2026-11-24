@@ -230,16 +230,12 @@ prompt, it tells the session which of its jobs no task watches and which results
   rq refuses `--no-output` and a video file (exit 64). Stills have no time limit: the 5 minute cap below is for light
   work only.
 - **Exclusive jobs** (`rq run --exclusive`) are for measurements (render timing, GPU load) that need the machine to
-  themselves. One waits in the main queue like any heavy job. Once it is next and nobody has the main turn, no
+  themselves, and for full renders (a whole film or cut; the user's rule, 2026-11-24, after the Mac hung with a full
+  render and two stills running). One waits in the main queue like any heavy job. Once it is next and nobody has the main turn, no
   light job or still starts any more, and it starts when the light jobs and stills running then have ended (and
   light work outside the queue, at `nice` 10 or more, too; a light job paused with `rq pause` doesn't count). While
-  it runs, the light and stills queues hold, for as long as its `--estimate`: then its log says so and it runs on
-  as an ordinary heavy job, with light jobs and stills beside it. It needs `--estimate`, at most 2 hours (exit 64
-  otherwise). The status page tags it "exclusive" and says until when the queues hold.
-- **Full renders** (`rq run --full-render`): a full render (a whole film or cut) is an exclusive job for its whole
-  run (the user's rule, 2026-11-24, after the Mac hung with a full render and two stills running). It waits and
-  starts like an exclusive job, but its `--estimate` has no limit, and the light and stills queues hold until it
-  ends, also past its estimate. The status page tags it "full render".
+  it runs, the light and stills queues hold, until it ends, also past its estimate. It needs `--estimate` (exit 64
+  otherwise), with no limit. The status page tags it "exclusive".
 - Light work is capped at 5 minutes while other work is active (a heavy job running or queued, or a light job
   waiting); alone, a light job runs on. Once it is past 5 minutes and other work shows up, it is paused where it is
   and moved to the end of the queue as a heavy job; it continues, with its progress, when it's its turn (the status
@@ -266,7 +262,7 @@ prompt, it tells the session which of its jobs no task watches and which results
 
 ```
 rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90m] [--detach]
-       [--again | --replace] [--exclusive | --full-render] -- COMMAND...
+       [--again | --replace] [--exclusive] -- COMMAND...
 rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace] -- COMMAND...
                              (light work: the light queue, one at a time (two while no heavy job runs), at nice 10)
 rq still --name NAME --output PATH... [--project P] [--detach] [--again | --replace] -- COMMAND...
@@ -419,7 +415,6 @@ Click a job under "Recent" (or open `http://localhost:8642/#job=ID`) to see what
 | `RQ_LIGHT_CAP` | `300` | `rq light` | seconds a light job may run before it moves into the queue |
 | `RQ_CANCEL_KILL` | `30` | `rq run`, `rq light` | seconds from `rq cancel` to SIGKILL of a job that still runs |
 | `RQ_STOP_KILL` | `10` | `rq run`, `rq light` | the same after the job's supervisor got SIGTERM |
-| `RQ_EXCLUSIVE_MAX` | `7200` | `rq run`, `rq estimate` | the longest `--estimate` of an exclusive job, in seconds |
 | `RQ_QUIET_WINDOW` | `120` | the dispatcher | seconds without outside work before the next job starts |
 | `RQ_SCRATCH_GLOB` | `/private/tmp/claude-UID/` | the dispatcher, `rq run`, `rq light` | where Claude Code keeps this user's scratchpads (where `--output` may point besides the project folder) |
 

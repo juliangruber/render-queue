@@ -11,9 +11,9 @@ streams the job's output live and exits with the job's exit code. Stopping it
 whose turn it is and serves the status page.
 
   rq run --name NAME (--output PATH... | --no-output) [--project P] [--estimate 90m] [--detach]
-         [--again | --replace] [--exclusive | --full-render] -- COMMAND [ARGS...]
-                                (--exclusive: alone on the machine, for measurements; see README)
-                               (--full-render: alone on the machine until it ends, for a full render)
+         [--again | --replace] [--exclusive] -- COMMAND [ARGS...]
+                                (--exclusive: alone on the machine until it ends, for measurements and full renders;
+                                 see README)
   rq light --name NAME (--output PATH... | --no-output) [--project P] [--detach] [--again | --replace]
          -- COMMAND [ARGS...]   (light work: the light queue, one at a time (two while the main queue runs
                                 nothing), at nice 10)
@@ -125,7 +125,6 @@ TICK = 2
 QUIET_NICE = 10  # processes at this niceness or more don't block the queue (stills, previews, tests)
 GROUP_HEAVY_CPU = 80  # a project's process group using this much CPU (%) outside the queue blocks it
 LIGHT_CAP = int(os.environ.get("RQ_LIGHT_CAP", 300))  # applies only while other work is active (other_work)  # seconds a light job may run; then it is paused and moved into the queue (rq keep ID exempts it)
-EXCLUSIVE_MAX = int(os.environ.get("RQ_EXCLUSIVE_MAX", 7200))  # the longest --estimate of rq run --exclusive (it is for measurements)
 QUIET_WINDOW = int(os.environ.get("RQ_QUIET_WINDOW", 120))  # seconds without outside work before the next job starts (bridges gaps between steps)
 TERMINAL = ("done", "failed", "cancelled", "lost")
 RQ_PATH = os.path.realpath(__file__)
@@ -990,15 +989,13 @@ def snapshot():
         job["took"] = took(job)
     news = see_jobs(([current] if current else []) + queued + light + light_queued + still + still_queued, finished,
                     jobs, d, now)
-    # what holds the light and stills queues: an exclusive job running (until: its hold ends), or one next in the
-    # main queue that waits for the light jobs and stills running now (waits_for) to end
+    # what holds the light and stills queues: an exclusive job running (until it ends), or one next in the main
+    # queue that waits for the light jobs and stills running now (waits_for) to end
     hold = exclusive_hold({j["id"]: j for j in jobs})
     exclusive = None
     if hold:
-        left = exclusive_left(hold, now)
-        exclusive = {"id": hold["id"], "project": hold["project"], "name": hold["name"], "full": bool(hold.get("full_render")),
-                     "running": hold["status"] != "queued", "until": now + left if left is not None else None,
-                     "estimate": hold.get("estimate"),
+        exclusive = {"id": hold["id"], "project": hold["project"], "name": hold["name"],
+                     "running": hold["status"] != "queued", "estimate": hold.get("estimate"),
                      "waits_for": [] if hold["status"] != "queued" else
                      ["%s/%s" % (j["project"], j["name"]) for j in side_running({j["id"]: j for j in jobs})]}
     return {"now": now, "exclusive": exclusive, "keep": keep_rules(now), "dispatcher": d,
@@ -1956,23 +1953,13 @@ def repair_grants(jobs):
             jobs[job["id"]] = new or load_job(job["id"]) or job
 
 
-def exclusive_left(job, now=None):
-    """Seconds an exclusive job running has left of its hold on the machine: its estimate, less the time it ran (rq
-    pause time left out). None for a job that isn't exclusive or hasn't started, and for a full render (rq run
-    --full-render), whose hold lasts until it ends."""
-    if not job.get("exclusive") or not job.get("started") or job.get("full_render"):
-        return None
-    return max(0, (job.get("estimate") or 0) - (run_time(job, now or time.time()) or 0))
-
-
 def exclusive_hold(jobs):
-    """The exclusive job that holds the side queues (rq run --exclusive), or None: the job with the main turn while
-    its estimate lasts (then it runs on as an ordinary heavy job), or, while nobody has the main turn, the job first
-    in the main queue: the light jobs and stills running then end, none starts, and then it gets the turn."""
+    """The exclusive job that holds the side queues (rq run --exclusive), or None: the job with the main turn, until
+    it ends, or, while nobody has the main turn, the job first in the main queue: the light jobs and stills running
+    then end, none starts, and then it gets the turn."""
     main = jobs.get(granted(GRANT) or "")
     if main and main["status"] not in TERMINAL:
-        left = exclusive_left(main)
-        return main if main.get("exclusive") and (left is None or left > 0) else None
+        return main if main.get("exclusive") else None
     queued = queue_order([j for j in jobs.values() if j["status"] == "queued" and not side(j) and waits(j)
                           and not on_hold(j)])
     return queued[0] if queued and queued[0].get("exclusive") else None
@@ -1989,25 +1976,6 @@ def jobs_running(jobs):
     side_running counts. JOBS_MAX caps it: a queue's own turn, too, waits while borrowed turns fill it."""
     main = jobs.get(granted(GRANT) or "")
     return bool(main and main["status"] not in TERMINAL) + len(side_running(jobs))
-
-
-def end_exclusive(jobs):
-    """An exclusive job whose estimate ran out: noted once in its record and its output, so its session knows that
-    from then on other jobs may run beside it."""
-    job = jobs.get(granted(GRANT) or "")
-    if not job or not job.get("exclusive") or job["status"] != "running" or job.get("exclusive_over"):
-        return
-    if exclusive_left(job) == 0:
-        new = update_job(job["id"], only_if=lambda j: j["status"] == "running" and not j.get("exclusive_over"),
-                         exclusive_over=time.time())
-        if new:
-            jobs[job["id"]] = new
-            try:
-                with open(os.path.join(LOGS, job["id"] + ".log"), "a") as f:
-                    f.write("[rq %s] its exclusive time (the estimate, %s) is over: light jobs and stills may run "
-                            "beside it from now on\n" % (time.strftime("%H:%M:%S"), fmt_duration(job.get("estimate"))))
-            except OSError:
-                pass
 
 
 def keep_rules(now=None):
@@ -2258,7 +2226,6 @@ def dispatch_once(state):
     try:
         sweep(jobs)
         repair_grants(jobs)
-        end_exclusive(jobs)
         apply_keep(jobs)
         dispatch_main(state, jobs)  # (first: a job it grants the main turn leaves the light queue one turn)
         hold = bool(exclusive_hold(jobs))
@@ -2668,16 +2635,10 @@ def cmd_run(args):
                              "renders/preview/", "--", "COMMAND"),
                       rq_cmd(args.cmd, "--name", "NAME", *est, "--no-output", "--", "COMMAND")), file=sys.stderr)
         return EXIT_USAGE
-    full_render = bool(getattr(args, "full_render", False))
-    exclusive = bool(getattr(args, "exclusive", False)) or full_render
+    exclusive = bool(getattr(args, "exclusive", False))
     if exclusive and not parse_duration(args.estimate):
-        print("rq: --exclusive needs --estimate: other jobs wait for it, and its hold on the machine lasts as long "
-              "as its estimate. Nothing was queued.", file=sys.stderr)
-        return EXIT_USAGE
-    if exclusive and not full_render and parse_duration(args.estimate) > EXCLUSIVE_MAX:
-        print("rq: --exclusive is for measurements, at most %s (this one: %s); a longer job goes through rq run "
-              "without it (a full render: --full-render). Nothing was queued." % (fmt_duration(EXCLUSIVE_MAX), fmt_duration(
-                  parse_duration(args.estimate))), file=sys.stderr)
+        print("rq: --exclusive needs --estimate: other jobs wait for it, all of them until it ends. Nothing was "
+              "queued.", file=sys.stderr)
         return EXIT_USAGE
     argv = ["/bin/zsh", "-c", command[0]] if len(command) == 1 else command
     light = args.cmd in SIDE
@@ -2741,8 +2702,6 @@ def cmd_run(args):
         job["no_output"] = True
     if exclusive:
         job["exclusive"] = True
-    if full_render:
-        job["full_render"] = True
     try:
         job["tools"] = detect_tools(text, cwd)
     except Exception:
@@ -3718,8 +3677,6 @@ def cmd_estimate(args):
     seconds = parse_duration(args.duration)
     if not seconds:
         sys.exit("rq: %r isn't a duration (e.g. 45m, 2h30m)" % args.duration)
-    if job.get("exclusive") and not job.get("full_render") and seconds > EXCLUSIVE_MAX:
-        sys.exit("rq: %s is exclusive: at most %s" % (job["id"], fmt_duration(EXCLUSIVE_MAX)))
     if not update_job(job["id"], only_if=lambda j: j["status"] not in TERMINAL, estimate=seconds):
         sys.exit("rq: %s has just ended" % job["id"])
     print("rq: %s is expected to take %s" % (job["id"], fmt_duration(seconds)))
@@ -3871,8 +3828,7 @@ def cmd_status(args):
     if d.get("disk") is not None and d["disk"] < DISK_LOW:
         print("disk: only %.1f GB free: jobs that write pictures may fail" % (d["disk"] / 1e9))
     def seen(j):  # who sees a job: nobody watches it, its session ended, its owner is gone, nobody saw its result
-        marks = ["full render" if j.get("full_render") else "exclusive"] if j.get("exclusive") and not j.get(
-            "exclusive_over") else []
+        marks = ["exclusive"] if j.get("exclusive") else []
         if j.get("held") is not None:
             marks.append("HELD" + (" until %.0f GB are free" % (j["held"] / 1e9) if j["held"] else ""))
         if j.get("owner_alive") is False:
@@ -3892,8 +3848,7 @@ def cmd_status(args):
     x = snap.get("exclusive")
     if x:
         print("\nheld:     no light job or still starts: %s" % (
-            "full render %s/%s runs alone until it ends" % (x["project"], x["name"]) if x["running"] and x.get("full")
-            else "exclusive %s/%s runs alone until ~%s" % (x["project"], x["name"], fmt_time(x["until"])) if x["running"]
+            "exclusive %s/%s runs alone until it ends" % (x["project"], x["name"]) if x["running"]
             else "exclusive %s/%s is next%s" % (x["project"], x["name"], ", once %s ended" % ", ".join(x["waits_for"])
                                                   if x["waits_for"] else "")))
     for i, r in enumerate(snap.get("keep") or []):
@@ -4159,15 +4114,10 @@ def main():
                            help="first cancel this project's jobs with this name that are still queued or running; "
                                 "a queued one's place in the queue goes to this job")
         if name == "run":
-            alone = r.add_mutually_exclusive_group()
-            alone.add_argument("--full-render", action="store_true",
-                               help="a full render (a whole film or cut): like --exclusive, but with no limit on "
-                                    "--estimate, and no light job or still starts beside it until it ends")
-            alone.add_argument("--exclusive", action="store_true",
-                               help="run alone on the machine, for measurements (timing, GPU load): it starts once "
-                                    "no light job or still runs, and none starts beside it while its --estimate "
-                                    "(needed, at most %s) lasts; then it runs on as an ordinary heavy job"
-                                    % fmt_duration(EXCLUSIVE_MAX))
+            r.add_argument("--exclusive", action="store_true",
+                           help="run alone on the machine, for measurements (timing, GPU load) and full renders: it "
+                                "starts once no light job or still runs, and none starts beside it until it ends "
+                                "(needs --estimate)")
         r.add_argument("command", nargs=argparse.REMAINDER)
     w = sub.add_parser("wait", help="watch jobs again: their output from here, then their exit code (never cancels); "
                                     "with several IDs, all count as watched at once")
