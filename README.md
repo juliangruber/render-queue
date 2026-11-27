@@ -232,8 +232,9 @@ prompt, it tells the session which of its jobs no task watches and which results
 - **Exclusive jobs** (`rq run --exclusive`) are for measurements (render timing, GPU load) that need the machine to
   themselves, and for full renders (a whole film or cut; the user's rule, 2026-11-24, after the Mac hung with a full
   render and two stills running). One waits in the main queue like any heavy job. Once it is next and nobody has the main turn, no
-  light job or still starts any more, and it starts when the light jobs and stills running then have ended (and
-  light work outside the queue, at `nice` 10 or more, too; a light job paused with `rq pause` doesn't count). While
+  light job or still starts any more, and it starts when the light jobs and stills running then have ended (a
+  light job paused with `rq pause` doesn't count; light work outside the queue, at `nice` 10 or more, may run on
+  beside it, the user's rule, 2026-11-27). While
   it runs, the light and stills queues hold, until it ends, also past its estimate. It needs `--estimate` (exit 64
   otherwise), with no limit. The status page tags it "exclusive".
 - Light work is capped at 5 minutes while other work is active (a heavy job running or queued, or a light job
